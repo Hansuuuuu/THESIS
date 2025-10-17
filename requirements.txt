@@ -1,0 +1,4 @@
+# Core dependencies
+pyinstaller
+PyQt5
+Pillow
