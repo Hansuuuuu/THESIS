@@ -2,13 +2,19 @@
 # Full-featured controller for student/teacher clients with improved UI and features
 #testing
 
+from email.mime import message
 import sys
 import os
 import socket
 import threading
 import struct
+import io
 import json
 import time
+import mss
+import numpy as np
+import cv2
+from PIL import ImageGrab, Image
 from datetime import datetime
 from queue import Queue, Empty
 from collections import defaultdict
@@ -43,10 +49,14 @@ def format_bytes(bytes_size):
         bytes_size /= 1024.0
     return f"{bytes_size:.2f} TB"
 
+# Constants (you can adjust)
+SCREENSHOT_QUALITY = 60      # JPEG quality
+SCREEN_SHARE_INTERVAL = 0.03  # seconds per frame (≈ 30 FPS)
+
 # ============ Client Handler ============
 class ClientHandler:
-    """Enhanced client handler with better protocol support"""
-    
+    """Enhanced client handler with screen share support"""
+
     def __init__(self, sock: socket.socket, addr, server):
         self.sock = sock
         self.addr = addr
@@ -56,7 +66,7 @@ class ClientHandler:
         self.running = threading.Event()
         self.running.set()
         self.lock = threading.Lock()
-        
+
         # Statistics
         self.last_image = None
         self.last_image_ts = None
@@ -70,6 +80,68 @@ class ClientHandler:
             "hostname": addr[0],
             "status": "connected"
         }
+
+        # Screen share
+        self.sharing_active = False
+        self.client_socket = sock
+        self.connected = True
+
+    def start_screen_share(self):
+        """Start continuous screen sharing"""
+
+        if not self.connected:
+            print("[❌] Cannot start screen sharing: not connected")
+            return
+        if getattr(self, "sharing_active", False):
+            print("[ℹ️] Screen sharing is already active")
+            return
+
+        self.sharing_active = True
+        print("[🖥️] Starting screen sharing...")
+
+        def share_loop():
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]  # Primary display
+                while self.sharing_active and self.connected:
+                    try:
+                        frame = np.array(sct.grab(monitor))
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+
+                        # Encode frame in memory for streaming (not saving)
+                        success, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+                        if not success:
+                            continue
+
+                        data = encoded.tobytes()
+                        header = b"FRAME\n"
+                        size = struct.pack(">Q", len(data))
+                        self.client_socket.sendall(header + size + data)
+
+                        # Optional: track stats
+                        self.frames_received = getattr(self, "frames_received", 0) + 1
+                        self.bytes_received = getattr(self, "bytes_received", 0) + len(data)
+
+                        # Control frame rate
+                        time.sleep(SCREEN_SHARE_INTERVAL)
+
+                    except Exception as e:
+                        print(f"[⚠️] Screen share error: {e}")
+                        break
+
+            # Clean up after stopping
+            self.sharing_active = False
+            print("[🛑] Screen sharing stopped")
+
+        # Run in a separate thread
+        threading.Thread(target=share_loop, daemon=True).start()
+
+    def stop_screen_share(self):
+        """Stop continuous screen sharing"""
+        if getattr(self, "sharing_active", False):
+            self.sharing_active = False
+            print("[🛑] Stopping screen sharing...")
+        else:
+            print("[ℹ️] Screen sharing is not active")
 
     def start(self):
         self.thread.start()
@@ -97,8 +169,8 @@ class ClientHandler:
             self.server.log(f"❌ Send error to {self.key}: {e}")
             return False
 
-    def send_file(self, filepath: str):
-        """Send file to client"""
+    def send_file(self, filepath: str, destination: str = None):
+        """Send file to client with optional destination path"""
         if not os.path.exists(filepath):
             self.server.log(f"❌ File not found: {filepath}")
             return False
@@ -107,11 +179,28 @@ class ClientHandler:
             basename = os.path.basename(filepath)
             filesize = os.path.getsize(filepath)
             
-            self.server.log(f"📤 Sending {basename} ({format_bytes(filesize)}) to {self.key}")
+            # Default to Downloads if no destination specified
+            if not destination:
+                destination = "Downloads"
             
-            header = f"SEND_FILE:{basename}\n".encode("utf-8")
+            self.server.log(f"📤 Sending {basename} ({format_bytes(filesize)}) to {self.key} -> {destination}")
+            
+            # Create metadata JSON with destination info
+            metadata = {
+                "filename": basename,
+                "destination": destination,
+                "timestamp": int(time.time())
+            }
+            meta_json = json.dumps(metadata).encode('utf-8')
+            
+            # Protocol: "SEND_FILE\n" + metadata_length(4 bytes) + metadata + file_data
+            header = b"SEND_FILE\n"
+            meta_len = struct.pack(">I", len(meta_json))
+            
             with self.lock:
                 self.sock.sendall(header)
+                self.sock.sendall(meta_len)
+                self.sock.sendall(meta_json)
                 time.sleep(0.05)
                 
                 sent = 0
@@ -135,31 +224,27 @@ class ClientHandler:
     def _reader_loop(self):
         """Read data from client"""
         sock = self.sock
-        sock.settimeout(30.0)  # 30 second timeout - long enough for heartbeats
-        
+        sock.settimeout(30.0)
+
         try:
             buffer = b""
-            
             while self.running.is_set():
                 try:
-                    # Read data
                     data = sock.recv(RECV_BUFFER)
                     if not data:
                         self.server.log(f"⚠️ Client {self.key} closed connection")
                         break
-                    
+
                     buffer += data
-                    
-                    # Process complete messages (ending with newline)
+
                     while b'\n' in buffer:
                         line, buffer = buffer.split(b'\n', 1)
                         header = line.decode('utf-8', errors='ignore').strip()
-                        
                         if not header:
                             continue
-                        
+
                         try:
-                            # Process the header - wrap in try/except to avoid disconnect on errors
+                            # Handle live screen frames (do NOT save)
                             if header.upper() == "FRAME":
                                 # Read 8-byte size
                                 while len(buffer) < 8:
@@ -167,71 +252,64 @@ class ClientHandler:
                                     if not chunk:
                                         raise ConnectionError("Connection closed while reading frame size")
                                     buffer += chunk
-                                
+
                                 size_bytes = buffer[:8]
                                 buffer = buffer[8:]
                                 size = struct.unpack(">Q", size_bytes)[0]
-                                
+
                                 if size <= 0 or size > MAX_IMAGE_SIZE:
                                     self.server.log(f"⚠️ Invalid frame size from {self.key}: {size}")
                                     continue
-                                
+
                                 # Read frame data
                                 while len(buffer) < size:
                                     chunk = sock.recv(min(RECV_BUFFER, size - len(buffer)))
                                     if not chunk:
                                         raise ConnectionError("Connection closed while reading frame data")
                                     buffer += chunk
-                                
+
                                 frame_data = buffer[:size]
                                 buffer = buffer[size:]
-                                
+
+                                # Only show on UI, never save
                                 self.last_image = frame_data
                                 self.last_image_ts = time.time()
                                 self.frames_received += 1
                                 self.bytes_received += len(frame_data)
-                                
-                                self.server.on_client_frame(self.key, frame_data)
-                                
-                            elif header.upper() in ("FILE_BACK", "FILE"):
-                                # Handle file upload
-                                self._receive_file_from_buffer(sock, buffer)
-                                buffer = b""  # Clear buffer after file
-                            
+
+                                if hasattr(self.server, "signals"):
+                                    self.server.signals.new_frame.emit(self.key, frame_data)
+                                else:
+                                    self.server.on_client_frame(self.key, frame_data)
+
                             elif header.upper() == "HEARTBEAT":
-                                # Heartbeat received - update timestamp
                                 self.last_heartbeat = time.time()
-                                # Don't log every heartbeat to reduce noise
-                                
+
                             elif header.upper().startswith("STATUS"):
                                 self.server.log(f"📊 Status from {self.key}: {header}")
-                                
+
                             elif header.upper().startswith("MSG"):
                                 self.server.log(f"💬 Message from {self.key}: {header}")
-                                
+
                             else:
-                                # Log unknown header
-                                self.server.log(f"📝 From {self.key}: {header}")
-                        
+                                self.server.log(f"📢 From {self.key}: {header}")
+
                         except Exception as header_error:
                             self.server.log(f"⚠️ Error processing header '{header}' from {self.key}: {header_error}")
-                            # Don't break connection, just skip this message
                             continue
-                    
+
                 except socket.timeout:
-                    # Check if client is still alive (heartbeat should come every 10s)
-                    time_since_heartbeat = time.time() - self.last_heartbeat
-                    if time_since_heartbeat > 60:  # 60 seconds without heartbeat
-                        self.server.log(f"⏱️ Client {self.key} timed out (no heartbeat for {int(time_since_heartbeat)}s)")
+                    if time.time() - self.last_heartbeat > 60:
+                        self.server.log(f"⏱️ Client {self.key} timed out")
                         break
-                    # Otherwise timeout is normal, continue
                     continue
+
                 except Exception as e:
                     self.server.log(f"⚠️ Read error from {self.key}: {e}")
                     import traceback
                     self.server.log(f"Traceback: {traceback.format_exc()}")
                     break
-                    
+
         except Exception as e:
             self.server.log(f"❌ Handler error for {self.key}: {e}")
         finally:
@@ -240,6 +318,132 @@ class ClientHandler:
             self.server.log(f"❌ {self.key} disconnected")
             self.server.remove_client(self.key)
 
+    def get_stats(self):
+        """Get client statistics"""
+        uptime = time.time() - self.connected_time
+        return {
+            "key": self.key,
+            "uptime": uptime,
+            "frames": self.frames_received,
+            "bytes": self.bytes_received,
+            "files": self.files_received,
+            "streaming": self.is_streaming,
+            "status": self.client_info["status"]
+        }
+
+
+    def _reader_loop(self):
+        """Read data from client"""
+        sock = self.sock
+        sock.settimeout(30.0)
+
+        try:
+            buffer = b""
+            while self.running.is_set():
+                try:
+                    data = sock.recv(RECV_BUFFER)
+                    if not data:
+                        self.server.log(f"⚠️ Client {self.key} closed connection")
+                        break
+
+                    buffer += data
+
+                    while b'\n' in buffer:
+                        line, buffer = buffer.split(b'\n', 1)
+                        header = line.decode('utf-8', errors='ignore').strip()
+                        if not header:
+                            continue
+
+                        try:
+                            # ✅ Handle live screen frames (do NOT save)
+                            if header.upper() == "FRAME":
+                                # Read 8-byte size
+                                while len(buffer) < 8:
+                                    chunk = sock.recv(RECV_BUFFER)
+                                    if not chunk:
+                                        raise ConnectionError("Connection closed while reading frame size")
+                                    buffer += chunk
+
+                                size_bytes = buffer[:8]
+                                buffer = buffer[8:]
+                                size = struct.unpack(">Q", size_bytes)[0]
+
+                                if size <= 0 or size > MAX_IMAGE_SIZE:
+                                    self.server.log(f"⚠️ Invalid frame size from {self.key}: {size}")
+                                    continue
+
+                                # Read frame data
+                                while len(buffer) < size:
+                                    chunk = sock.recv(min(RECV_BUFFER, size - len(buffer)))
+                                    if not chunk:
+                                        raise ConnectionError("Connection closed while reading frame data")
+                                    buffer += chunk
+
+                                frame_data = buffer[:size]
+                                buffer = buffer[size:]
+
+                                # ✅ Only show on UI, never save
+                                self.last_image = frame_data
+                                self.last_image_ts = time.time()
+                                self.frames_received += 1
+                                self.bytes_received += len(frame_data)
+
+                                if hasattr(self.server, "signals"):
+                                    self.server.signals.new_frame.emit(self.key, frame_data)
+                                else:
+                                    self.server.on_client_frame(self.key, frame_data)
+
+                            # ✅ Handle actual file transfers only (non-screen)
+                            elif header.upper() in ("FILE", "FILE_BACK"):
+                                # Peek at metadata to skip screen captures
+                                peek = buffer[:200].lower()
+                                if b".jpg" in peek or b".jpeg" in peek or b"frame" in peek:
+                                    self.server.log(f"🚫 Skipped screen frame pretending to be file from {self.key}")
+                                    # discard data instead of saving
+                                    buffer = b""
+                                    continue
+
+                                # otherwise handle normal file
+                                self._receive_file_from_buffer(sock, buffer)
+                                buffer = b""
+
+                            elif header.upper() == "HEARTBEAT":
+                                self.last_heartbeat = time.time()
+
+                            elif header.upper().startswith("STATUS"):
+                                self.server.log(f"📊 Status from {self.key}: {header}")
+
+                            elif header.upper().startswith("MSG"):
+                                self.server.log(f"💬 Message from {self.key}: {header}")
+
+                            else:
+                                self.server.log(f"📝 From {self.key}: {header}")
+
+                        except Exception as header_error:
+                            self.server.log(f"⚠️ Error processing header '{header}' from {self.key}: {header_error}")
+                            continue
+
+                except socket.timeout:
+                    if time.time() - self.last_heartbeat > 60:
+                        self.server.log(f"⏱️ Client {self.key} timed out")
+                        break
+                    continue
+
+                except Exception as e:
+                    self.server.log(f"⚠️ Read error from {self.key}: {e}")
+                    import traceback
+                    self.server.log(f"Traceback: {traceback.format_exc()}")
+                    break
+
+        except Exception as e:
+            self.server.log(f"❌ Handler error for {self.key}: {e}")
+        finally:
+            self.running.clear()
+            self.client_info["status"] = "disconnected"
+            self.server.log(f"❌ {self.key} disconnected")
+            self.server.remove_client(self.key)
+
+            
     def _receive_file_from_buffer(self, sock, initial_buffer):
         """Receive file data"""
         try:
@@ -279,6 +483,18 @@ class ClientHandler:
             # Generate filename
             fname = metadata.get("filename") or f"{self.key.replace(':','_')}_{int(time.time())}"
             fname = os.path.basename(fname)
+
+            # # 🚫 Ignore screenshots or JPEG frames
+            # if fname.lower().endswith((".jpg", ".jpeg")) or "frame" in fname.lower():
+            #     self.server.log(f"🚫 Ignored incoming screen frame file from {self.key}: {fname}")
+            #     # Read and discard data instead of saving it
+            #     remaining = filesize
+            #     while remaining > 0:
+            #         chunk = sock.recv(min(RECV_BUFFER, remaining))
+            #         if not chunk:
+            #             break
+            #         remaining -= len(chunk)
+            #     return  # Skip saving
             
             outpath = os.path.join(INBOX_DIR, fname)
             tmp_path = outpath + ".part"
@@ -287,7 +503,6 @@ class ClientHandler:
             
             # Write file
             with open(tmp_path, "wb") as outf:
-                # Write what we already have in buffer
                 to_write = min(len(buffer), filesize)
                 outf.write(buffer[:to_write])
                 remaining = filesize - to_write
@@ -317,6 +532,7 @@ class ClientHandler:
                     os.remove(tmp_path)
             except:
                 pass
+
 
     def get_stats(self):
         """Get client statistics"""
@@ -427,16 +643,21 @@ class AdminServer:
                 self.log(f"🗑️ Removed client: {key} (Remaining: {len(self.clients)})")
 
     def broadcast_command(self, cmd_str: str):
-        """Send command to all clients"""
+        """Send command to all connected clients"""
         with self.clients_lock:
             clients = list(self.clients.values())
-        
+
         success = 0
         for handler in clients:
-            if handler.send_command(cmd_str):
+            try:
+                # Send properly encoded command with newline
+                handler.client_socket.sendall((cmd_str + "\n").encode())
                 success += 1
-        
+            except Exception as e:
+                self.log(f"❌ Failed to send '{cmd_str}' to a client: {e}")
+
         self.log(f"📢 Broadcast '{cmd_str}' to {success}/{len(clients)} clients")
+
 
     def send_file_to_clients(self, filepath: str, keys: list):
         """Send file to specific clients"""
@@ -455,19 +676,13 @@ class AdminServer:
         self.log_queue.put(f"[{timestamp}] {msg}")
 
     def on_client_frame(self, client_key: str, image_bytes: bytes):
-        """Handle received frame"""
+        """Handle received frame — display only, do NOT save to disk"""
         try:
-            ts = int(time.time() * 1000)
-            fname = os.path.join(INBOX_DIR, f"{client_key.replace(':','_')}_frame_{ts}.jpg")
-            
-            with open(fname, "wb") as f:
-                f.write(image_bytes)
-            
-            # Put in frame queue for UI update
+            # Just forward to frame queue or signal for live viewing
             self.frame_queue.put((client_key, image_bytes))
-            
+            # (No file saving)
         except Exception as e:
-            self.log(f"❌ Error saving frame from {client_key}: {e}")
+            self.log(f"❌ Error handling live frame from {client_key}: {e}")
 
     def on_client_file(self, client_key: str, filepath: str, metadata: dict):
         """Handle received file"""
@@ -589,6 +804,10 @@ class AdminWindow(QMainWindow):
         
         self._build_ui()
         self._start_timers()
+        
+    def log(self, message):
+        """Write log message to console or admin log area"""
+        print(message)  # or append to a QTextEdit if you have one
 
     def _build_ui(self):
         """Build the user interface"""
@@ -784,6 +1003,17 @@ class AdminWindow(QMainWindow):
         layout.addLayout(controls)
         
         return widget
+
+    def update_preview(self, client_key, data):
+        pixmap = QPixmap()
+        pixmap.loadFromData(data)
+        scaled = pixmap.scaled(
+            self.lbl_preview.size(),
+            Qt.KeepAspectRatio,
+            Qt.SmoothTransformation
+        )
+        self.lbl_preview.setPixmap(scaled)
+        self.lbl_preview_info.setText(f"📡 Live stream from {client_key}")
 
     def _create_files_tab(self):
         """Create files and inbox tab"""
@@ -981,35 +1211,90 @@ class AdminWindow(QMainWindow):
         return [it.text().replace("💻 ", "") for it in self.lst_clients.selectedItems()]
 
     def send_to_selected(self, command):
-        """Send command to selected clients"""
+        """Send command to selected clients only"""
         keys = self._get_selected_keys()
         if not keys:
             QMessageBox.warning(self, "No Selection", "Please select one or more clients")
             return
-        
+
+        sent = 0
         with self.server.clients_lock:
             for k in keys:
                 if k in self.server.clients:
-                    self.server.clients[k].send_command(command)
+                    try:
+                        self.server.clients[k].client_socket.sendall((command + "\n").encode())
+                        sent += 1
+                    except Exception as e:
+                        self.log(f"❌ Failed to send '{command}' to {k}: {e}")
+
+        self.log(f"📨 Sent '{command}' to {sent}/{len(keys)} selected clients")
+
+    # Add this method to AdminWindow class in admin.py:
 
     def send_file_to_selected(self):
-        """Send file to selected clients"""
+        """Send file to selected clients with destination choice"""
         keys = self._get_selected_keys()
         if not keys:
             QMessageBox.warning(self, "No Selection", "Please select one or more clients")
             return
         
+        # Choose file
         path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send")
-        if path:
-            self.server.send_file_to_clients(path, keys)
-            QMessageBox.information(
+        if not path:
+            return
+        
+        # Show dialog for destination
+        destinations = [
+            "Downloads",
+            "Desktop",
+            "Documents",
+            "Custom Path..."
+        ]
+        
+        destination, ok = QInputDialog.getItem(
+            self,
+            "Select Destination",
+            "Where should the file be saved on the client?",
+            destinations,
+            0,
+            False
+        )
+        
+        if not ok:
+            return
+        
+        # If custom path selected, ask user to input it
+        if destination == "Custom Path...":
+            destination, ok = QInputDialog.getText(
                 self,
-                "File Transfer",
-                f"Sending {os.path.basename(path)} to {len(keys)} client(s)"
+                "Custom Destination",
+                "Enter the full path (e.g., C:\\Users\\Student\\Desktop or /home/user/Documents):",
+                text="C:\\"
             )
+            if not ok or not destination:
+                return
+        
+        # Send file to selected clients
+        with self.server.clients_lock:
+            sent = 0
+            for k in keys:
+                if k in self.server.clients:
+                    threading.Thread(
+                        target=self.server.clients[k].send_file,
+                        args=(path, destination),
+                        daemon=True
+                    ).start()
+                    sent += 1
+        
+        QMessageBox.information(
+            self,
+            "File Transfer",
+            f"Sending {os.path.basename(path)} to {sent} client(s)\nDestination: {destination}"
+        )
+
 
     def send_file_to_all(self):
-        """Send file to all clients"""
+        """Send file to all clients with destination choice"""
         path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send to All")
         if not path:
             return
@@ -1019,12 +1304,53 @@ class AdminWindow(QMainWindow):
             QMessageBox.warning(self, "No Clients", "No connected clients")
             return
         
-        self.server.send_file_to_clients(path, keys)
+        # Show dialog for destination
+        destinations = [
+            "Downloads",
+            "Desktop",
+            "Documents",
+            "Custom Path..."
+        ]
+        
+        destination, ok = QInputDialog.getItem(
+            self,
+            "Select Destination",
+            "Where should the file be saved on all clients?",
+            destinations,
+            0,
+            False
+        )
+        
+        if not ok:
+            return
+        
+        # If custom path selected, ask user to input it
+        if destination == "Custom Path...":
+            destination, ok = QInputDialog.getText(
+                self,
+                "Custom Destination",
+                "Enter the full path (e.g., C:\\Users\\Student\\Desktop or /home/user/Documents):",
+                text="C:\\"
+            )
+            if not ok or not destination:
+                return
+        
+        # Send file to all clients
+        with self.server.clients_lock:
+            for k in keys:
+                if k in self.server.clients:
+                    threading.Thread(
+                        target=self.server.clients[k].send_file,
+                        args=(path, destination),
+                        daemon=True
+                    ).start()
+        
         QMessageBox.information(
             self,
             "File Transfer",
-            f"Sending {os.path.basename(path)} to {len(keys)} client(s)"
+            f"Sending {os.path.basename(path)} to {len(keys)} client(s)\nDestination: {destination}"
         )
+
 
     def send_message_to_selected(self):
         """Send message to selected clients"""

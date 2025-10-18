@@ -5,23 +5,90 @@ import threading
 import struct
 import time
 import io
+import json
+import mss
+import cv2
+import numpy as np
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, 
                              QPushButton, QMessageBox, QTextEdit, QProgressBar,
-                             QHBoxLayout, QSystemTrayIcon, QMenu, QAction)
+                             QHBoxLayout, QSystemTrayIcon, QMenu, QAction, QInputDialog)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QIcon, QFont
+from PyQt5.QtGui import QPixmap, QIcon, QFont, QColor, QPalette
 from PIL import ImageGrab
 
 # ==============================
 # Configuration
 # ==============================
-SERVER_HOST = '192.168.68.106'  # Change this to admin/teacher IP
+SERVER_HOST = '192.168.68.103'  # Change this to admin/teacher IP
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000  # milliseconds
 SCREENSHOT_QUALITY = 85  # JPEG quality (1-100)
 STREAM_FPS = 10  # Frames per second for streaming
+# Constants (you can adjust)
+SCREENSHOT_QUALITY = 60      # JPEG quality
+SCREEN_SHARE_INTERVAL = 0.03  # seconds per frame (≈ 30 FPS)
+
+
+
+class LockOverlay(QWidget):
+    """Full-screen overlay that blocks all input and shows a lock message"""
+    def __init__(self, message="🔒 Locked by Administrator", logo_path=None):
+        super().__init__()
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.X11BypassWindowManagerHint)
+        self.setWindowModality(Qt.ApplicationModal)
+        self.setWindowTitle("Locked")
+
+        # Make background black
+        palette = QPalette()
+        palette.setColor(QPalette.Window, QColor(0, 0, 0))
+        self.setPalette(palette)
+        self.setAutoFillBackground(True)
+
+        layout = QVBoxLayout()
+        layout.setAlignment(Qt.AlignCenter)
+
+        # Optional logo
+        if logo_path:
+            logo = QLabel()
+            pix = QPixmap(logo_path)
+            logo.setPixmap(pix.scaledToHeight(200, Qt.SmoothTransformation))
+            logo.setAlignment(Qt.AlignCenter)
+            layout.addWidget(logo)
+
+        # Message label
+        label = QLabel(message)
+        label.setStyleSheet("color: white; font-size: 28px; font-weight: bold;")
+        label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(label)
+
+        self.setLayout(layout)
+
+        # Prevent keyboard/mouse interaction
+        self.grabKeyboard()
+        self.grabMouse()
+        
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_U:
+                code, ok = QInputDialog.getText(self, "Unlock", "Enter admin code:")
+        if ok and code == "admin123":  # Replace with your admin code
+            self.close()
+        else:
+            pass
+
+    def keyPressEvent(self, event):
+        pass  # ignore all keys
+
+    def mousePressEvent(self, event):
+        pass  # ignore clicks
+
+    def closeEvent(self, event):
+        # Release locks when closed
+        self.releaseKeyboard()
+        self.releaseMouse()
+        event.accept()
+
 
 # ==============================
 # Signal Handler for Thread-Safe GUI Updates
@@ -134,8 +201,8 @@ class StudentClient(QWidget):
         self.reconnect_button.setEnabled(False)
         button_layout.addWidget(self.reconnect_button)
         
-        self.share_screen_button = QPushButton("📷 Share Screen (Test)")
-        self.share_screen_button.clicked.connect(self.send_screen_once)
+        self.share_screen_button = QPushButton("📷 Share Screen (Start)")
+        self.share_screen_button.clicked.connect(self.toggle_screen_share)
         button_layout.addWidget(self.share_screen_button)
         
         self.minimize_button = QPushButton("➖ Minimize to Tray")
@@ -305,56 +372,58 @@ class StudentClient(QWidget):
                 if self.running:
                     QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
 
-    def listen_for_commands(self):
-        """Listen for commands from server"""
-        self.sock.settimeout(1.0)  # Set timeout for recv
-        buffer = b""
+    # def listen_for_commands(self):
+    #     """Listen for commands from server"""
+    #     self.sock.settimeout(1.0)  # Set timeout for recv
+    #     buffer = b""
         
-        while self.connected and self.running:
-            try:
-                data = self.client_socket.recv(BUFFER_SIZE)
-                if not data:
-                    self.log("Server closed connection")
-                    break
+    #     while self.connected and self.running:
+    #         try:
+    #             data = self.client_socket.recv(BUFFER_SIZE)
+    #             if not data:
+    #                 self.log("Server closed connection")
+    #                 break
                 
-                buffer += data
+    #             buffer += data
                 
-                # Process complete commands (ending with newline)
-                while b'\n' in buffer:
-                    line, buffer = buffer.split(b'\n', 1)
-                    command = line.decode('utf-8', errors='ignore').strip()
+    #             # Process complete commands (ending with newline)
+    #             while b'\n' in buffer:
+    #                 line, buffer = buffer.split(b'\n', 1)
+    #                 command = line.decode('utf-8', errors='ignore').strip()
                     
-                    if not command:
-                        continue
+    #                 if not command:
+    #                     continue
                     
-                    self.log(f"Received command: {command}")
+    #                 self.log(f"Received command: {command}")
                     
-                    # Process command in separate thread to avoid blocking
-                    threading.Thread(
-                        target=self.process_command,
-                        args=(command,),
-                        daemon=True
-                    ).start()
+    #                 # Process command in separate thread to avoid blocking
+    #                 threading.Thread(
+    #                     target=self.process_command,
+    #                     args=(command,),
+    #                     daemon=True
+    #                 ).start()
                     
-            except socket.timeout:
-                # Timeout is normal, just continue
-                continue
-            except Exception as e:
-                self.log(f"Listen error: {e}")
-                break
+    #         except socket.timeout:
+    #             # Timeout is normal, just continue
+    #             continue
+    #         except Exception as e:
+    #             self.log(f"Listen error: {e}")
+    #             break
         
-        # Connection lost
-        self.disconnect_socket()
-        self.signals.update_status.emit("❌ Disconnected from server", "red")
-        self.reconnect_button.setEnabled(True)
+    #     # Connection lost
+    #     self.disconnect_socket()
+    #     self.signals.update_status.emit("❌ Disconnected from server", "red")
+    #     self.reconnect_button.setEnabled(True)
         
-        if self.running:
-            self.log(f"Reconnecting in {RECONNECT_DELAY//1000} seconds...")
-            QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
+    #     if self.running:
+    #         self.log(f"Reconnecting in {RECONNECT_DELAY//1000} seconds...")
+    #         QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
 
     def process_command(self, command):
         """Process received command"""
+        print(f"[DEBUG] Received command: '{command}'")
         if command == "LOCK":
+            print("[DEBUG] Lock command received, locking now.")
             self.lock_screen()
         elif command == "UNLOCK":
             self.unlock_screen()
@@ -372,20 +441,26 @@ class StudentClient(QWidget):
             threading.Thread(target=self.receive_file, args=(filename,), daemon=True).start()
 
     def lock_screen(self):
-        """Lock the screen"""
-        self.locked = True
-        self.signals.update_status.emit("🔒 Screen is LOCKED by Admin", "red")
+        """Lock the student's screen"""
+        if getattr(self, "overlay", None) is not None:
+            return  # already locked
+
         self.log("Screen locked by administrator")
-        self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-        self.showFullScreen()
+        self.signals.update_status.emit("🔒 Screen is LOCKED by Admin", "red")
+
+        self.overlay = LockOverlay("🔒 Locked by Administrator", logo_path="school_logo.png")
+        self.overlay.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
+        self.overlay.showFullScreen()
 
     def unlock_screen(self):
-        """Unlock the screen"""
-        self.locked = False
+        """Unlock the student's screen"""
+        if getattr(self, "overlay", None):
+            self.overlay.close()
+            self.overlay = None
+
         self.signals.update_status.emit("✅ Screen unlocked", "green")
-        self.log("Screen unlocked")
-        self.setWindowFlags(Qt.Window)
-        self.showNormal()
+        self.log("Screen unlocked by administrator")
+        
 
     def display_message(self, title, message):
         """Display message box (thread-safe)"""
@@ -393,22 +468,48 @@ class StudentClient(QWidget):
         self.log(f"Message displayed: {message}")
 
     def receive_file(self, filename):
-        """Receive file from server"""
+        """Receive file from server with destination support"""
         try:
-            self.signals.file_progress.emit(0, f"Receiving: {filename}")
-            self.log(f"Starting file transfer: {filename}")
+            # Read metadata first
+            meta_len_bytes = self.client_socket.recv(4)
+            if len(meta_len_bytes) < 4:
+                self.log("Error: Could not read metadata length")
+                return
             
-            safe_filename = os.path.basename(filename)
-            downloads_path = os.path.join(os.path.expanduser("~"), "Downloads")
-            filepath = os.path.join(downloads_path, safe_filename)
+            meta_len = struct.unpack(">I", meta_len_bytes)[0]
+            meta_json = b""
             
-            # Ensure unique filename
-            base, ext = os.path.splitext(filepath)
-            counter = 1
-            while os.path.exists(filepath):
-                filepath = f"{base}_{counter}{ext}"
-                counter += 1
+            while len(meta_json) < meta_len:
+                chunk = self.client_socket.recv(meta_len - len(meta_json))
+                if not chunk:
+                    self.log("Error: Connection closed while reading metadata")
+                    return
+                meta_json += chunk
             
+            # Parse metadata
+            try:
+                metadata = json.loads(meta_json.decode('utf-8'))
+                destination = metadata.get("destination", "Downloads")
+                safe_filename = os.path.basename(metadata.get("filename", filename))
+            except:
+                destination = "Downloads"
+                safe_filename = os.path.basename(filename)
+            
+            self.signals.file_progress.emit(0, f"Receiving: {safe_filename}")
+            self.log(f"Starting file transfer: {safe_filename} -> {destination}")
+            
+            # Resolve destination path
+            filepath = self._resolve_destination_path(destination, safe_filename)
+            
+            if not filepath:
+                self.log(f"Error: Invalid destination path: {destination}")
+                self.signals.file_progress.emit(0, "Error: Invalid destination")
+                return
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Receive file data
             total_received = 0
             with open(filepath, 'wb') as f:
                 while True:
@@ -418,7 +519,6 @@ class StudentClient(QWidget):
                     
                     # Check for terminator
                     if b"<END>" in chunk:
-                        # Write data before terminator
                         end_pos = chunk.find(b"<END>")
                         if end_pos > 0:
                             f.write(chunk[:end_pos])
@@ -428,14 +528,14 @@ class StudentClient(QWidget):
                     f.write(chunk)
                     total_received += len(chunk)
                     
-                    # Update progress (estimate)
+                    # Update progress
                     if total_received % (BUFFER_SIZE * 10) == 0:
                         self.signals.file_progress.emit(50, f"Receiving: {total_received//1024} KB")
             
             self.signals.file_progress.emit(100, f"Completed: {safe_filename}")
             self.log(f"File received successfully: {filepath}")
             self.signals.show_message.emit("File Received", 
-                                          f"File '{safe_filename}' saved to:\n{filepath}")
+                                        f"File '{safe_filename}' saved to:\n{filepath}")
             
             # Hide progress after 3 seconds
             QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
@@ -443,6 +543,193 @@ class StudentClient(QWidget):
         except Exception as e:
             self.log(f"File receive error: {e}")
             self.signals.file_progress.emit(0, f"Error: {str(e)}")
+            
+    def listen_for_commands(self):
+        """Listen for commands and files from server"""
+        self.client_socket.settimeout(1.0)
+        buffer = b""
+        
+        while self.connected and self.running:
+            try:
+                data = self.client_socket.recv(BUFFER_SIZE)
+                if not data:
+                    self.log("Server closed connection")
+                    break
+                
+                buffer += data
+                
+                # Process complete commands/headers (ending with newline)
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    command = line.decode('utf-8', errors='ignore').strip()
+                    
+                    if not command:
+                        continue
+                    
+                    self.log(f"Received command: {command}")
+                    
+                    # Check if this is a file transfer
+                    if command.upper() == "SEND_FILE":
+                        # File transfer incoming - handle in this thread
+                        self._receive_file_from_socket(buffer)
+                        buffer = b""  # Reset buffer after file transfer
+                    else:
+                        # Regular command - process in separate thread
+                        threading.Thread(
+                            target=self.process_command,
+                            args=(command,),
+                            daemon=True
+                        ).start()
+                    
+            except socket.timeout:
+                continue
+            except Exception as e:
+                self.log(f"Listen error: {e}")
+                break
+        
+        # Connection lost
+        self.disconnect_socket()
+        self.signals.update_status.emit("❌ Disconnected from server", "red")
+        self.reconnect_button.setEnabled(True)
+        
+        if self.running:
+            self.log(f"Reconnecting in {RECONNECT_DELAY//1000} seconds...")
+            QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
+
+
+    def _receive_file_from_socket(self, initial_buffer):
+        """Receive file directly from socket with metadata"""
+        try:
+            buffer = initial_buffer
+            
+            # Read metadata length (4 bytes)
+            while len(buffer) < 4:
+                chunk = self.client_socket.recv(BUFFER_SIZE)
+                if not chunk:
+                    self.log("Error: Connection closed while reading metadata length")
+                    return
+                buffer += chunk
+            
+            meta_len = struct.unpack(">I", buffer[:4])[0]
+            buffer = buffer[4:]
+            
+            # Read metadata JSON
+            while len(buffer) < meta_len:
+                chunk = self.client_socket.recv(BUFFER_SIZE)
+                if not chunk:
+                    self.log("Error: Connection closed while reading metadata")
+                    return
+                buffer += chunk
+            
+            meta_json = buffer[:meta_len]
+            buffer = buffer[meta_len:]
+            
+            # Parse metadata
+            try:
+                metadata = json.loads(meta_json.decode('utf-8'))
+                destination = metadata.get("destination", "Downloads")
+                safe_filename = os.path.basename(metadata.get("filename", "file"))
+            except Exception as e:
+                self.log(f"Error parsing metadata: {e}")
+                destination = "Downloads"
+                safe_filename = "file"
+            
+            self.signals.file_progress.emit(0, f"Receiving: {safe_filename}")
+            self.log(f"Starting file transfer: {safe_filename} -> {destination}")
+            
+            # Resolve destination path
+            filepath = self._resolve_destination_path(destination, safe_filename)
+            
+            if not filepath:
+                self.log(f"Error: Invalid destination path: {destination}")
+                self.signals.file_progress.emit(0, "Error: Invalid destination")
+                return
+            
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Receive file data
+            total_received = 0
+            with open(filepath, 'wb') as f:
+                while True:
+                    # Need at least some data
+                    if len(buffer) == 0:
+                        chunk = self.client_socket.recv(BUFFER_SIZE)
+                        if not chunk:
+                            self.log("Error: Connection closed during file transfer")
+                            break
+                        buffer += chunk
+                    
+                    # Check for terminator
+                    if b"<END>" in buffer:
+                        end_pos = buffer.find(b"<END>")
+                        if end_pos > 0:
+                            f.write(buffer[:end_pos])
+                            total_received += end_pos
+                        buffer = buffer[end_pos + 5:]  # Skip past <END>
+                        break
+                    
+                    # Write chunk
+                    to_write = len(buffer)
+                    f.write(buffer)
+                    total_received += to_write
+                    buffer = b""
+                    
+                    # Update progress
+                    if total_received % (BUFFER_SIZE * 5) == 0:
+                        self.signals.file_progress.emit(50, f"Receiving: {total_received//1024} KB")
+            
+            self.signals.file_progress.emit(100, f"Completed: {safe_filename}")
+            self.log(f"File received successfully: {filepath} ({total_received} bytes)")
+            self.signals.show_message.emit("File Received", 
+                                        f"File '{safe_filename}' saved to:\n{filepath}")
+            
+            # Hide progress after 3 seconds
+            QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
+            
+        except Exception as e:
+            self.log(f"File receive error: {e}")
+            import traceback
+            self.log(f"Traceback: {traceback.format_exc()}")
+            self.signals.file_progress.emit(0, f"Error: {str(e)}")
+
+
+    def _resolve_destination_path(self, destination, filename):
+        """Resolve destination path, handling special keywords and custom paths"""
+        try:
+            home = os.path.expanduser("~")
+            
+            # Handle common destinations
+            if destination.lower() == "downloads":
+                base_path = os.path.join(home, "Downloads")
+            elif destination.lower() == "desktop":
+                base_path = os.path.join(home, "Desktop")
+            elif destination.lower() == "documents":
+                base_path = os.path.join(home, "Documents")
+            else:
+                # Treat as custom path
+                base_path = destination
+            
+            # Validate and make absolute path
+            base_path = os.path.abspath(base_path)
+            
+            filepath = os.path.join(base_path, filename)
+            filepath = os.path.abspath(filepath)
+            
+            # Ensure unique filename if it exists
+            if os.path.exists(filepath):
+                base, ext = os.path.splitext(filepath)
+                counter = 1
+                while os.path.exists(f"{base}_{counter}{ext}"):
+                    counter += 1
+                filepath = f"{base}_{counter}{ext}"
+                self.log(f"File already exists, saving as: {os.path.basename(filepath)}")
+            
+            return filepath
+            
+        except Exception as e:
+            self.log(f"Error resolving destination path: {e}")
+            return None
 
     def update_file_progress(self, percentage, status):
         """Update file transfer progress (thread-safe)"""
@@ -485,6 +772,66 @@ class StudentClient(QWidget):
         except Exception as e:
             self.log(f"Screenshot send error: {e}")
             self.disconnect_socket()
+            
+
+            
+    def toggle_screen_share(self):
+        """Toggle continuous screen sharing on/off"""
+        if getattr(self, 'sharing_active', False):
+            self.stop_screen_share()
+            self.share_screen_button.setText("📷 Share Screen (Start)")
+        else:
+            self.start_screen_share()
+            self.share_screen_button.setText("🛑 Stop Screen Share")
+
+    def start_screen_share(self):
+        """Start continuous screen sharing"""
+        if not self.connected:
+            self.log("Cannot start screen sharing: not connected")
+            QMessageBox.warning(self, "Connection", "Not connected to admin server.")
+            return
+        if getattr(self, 'sharing_active', False):
+            self.log("Screen sharing already active")
+            return
+
+        self.sharing_active = True
+        self.log("Starting continuous screen sharing...")
+        self.signals.update_status.emit("🖥️ Screen sharing started", "blue")
+
+        def share_loop():
+            while self.sharing_active and self.connected:
+                try:
+                    screenshot = ImageGrab.grab()
+                    buffer = io.BytesIO()
+                    screenshot.save(buffer, format='JPEG', quality=SCREENSHOT_QUALITY, optimize=True)
+                    data = buffer.getvalue()
+
+                    header = b"FRAME\n"
+                    size = struct.pack(">Q", len(data))
+                    self.client_socket.sendall(header + size + data)
+
+                    # Control the frame rate
+                    time.sleep(SCREEN_SHARE_INTERVAL)
+
+                except Exception as e:
+                    self.log(f"Screen share error: {e}")
+                    break
+
+            # Clean up if stopped
+            self.sharing_active = False
+            self.log("Screen sharing stopped")
+            self.signals.update_status.emit("🛑 Screen sharing stopped", "red")
+
+        threading.Thread(target=share_loop, daemon=True).start()
+
+    def stop_screen_share(self):
+        """Stop continuous screen sharing"""
+        if getattr(self, 'sharing_active', False):
+            self.sharing_active = False
+            self.log("Stopping screen sharing...")
+        else:
+            self.log("Screen sharing is not active")
+
 
     def start_streaming_screen(self):
         """Start streaming screen"""
@@ -502,32 +849,41 @@ class StudentClient(QWidget):
             self.signals.update_status.emit("✅ Connected to Admin/Teacher Server", "green")
 
     def stream_screen(self):
-        """Stream screen continuously"""
-        frame_delay = 1.0 / STREAM_FPS
-        
-        try:
-            while self.screen_sharing and self.connected:
-                start_time = time.time()
-                
-                screenshot = ImageGrab.grab()
-                buffer = io.BytesIO()
-                screenshot.save(buffer, format='JPEG', quality=SCREENSHOT_QUALITY, optimize=True)
-                data = buffer.getvalue()
-                
-                # Send with protocol
-                header = b"FRAME\n"
-                size = struct.pack(">Q", len(data))
-                self.client_socket.sendall(header + size + data)
-                
-                # Maintain frame rate
-                elapsed = time.time() - start_time
-                sleep_time = max(0, frame_delay - elapsed)
-                time.sleep(sleep_time)
-                
-        except Exception as e:
-            self.log(f"Streaming error: {e}")
-            self.screen_sharing = False
-            self.disconnect_socket()
+        """Continuously capture and send the screen in real-time"""
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]  # Primary monitor
+            fps = 20  # ⬆️ increase FPS slightly
+            jpeg_quality = 50  # ⬇️ lower quality for faster transfer
+            
+            try:
+                while self.screen_sharing and self.connected:
+                    frame_start = time.time()
+
+                    # Capture fast frame
+                    img = np.array(sct.grab(monitor))
+                    frame = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
+                    
+                    # Resize for speed (optional)
+                    frame = cv2.resize(frame, (1280, 720))  # 720p stream
+
+                    # Compress to JPEG (small, fast)
+                    ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality])
+                    if not ret:
+                        continue
+
+                    # Send frame
+                    data = buffer.tobytes()
+                    size = struct.pack(">Q", len(data))
+                    self.client_socket.sendall(b"FRAME\n" + size + data)
+
+                    # Maintain FPS
+                    elapsed = time.time() - frame_start
+                    sleep_time = max(0, 1/fps - elapsed)
+                    time.sleep(sleep_time)
+
+            except Exception as e:
+                self.log(f"Streaming error: {e}")
+                self.screen_sharing = False
 
     def quit_application(self):
         """Quit the application"""
