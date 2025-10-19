@@ -24,12 +24,13 @@ from PyQt5.QtWidgets import (
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
     QMessageBox, QTextEdit, QSizePolicy, QSplitter, QInputDialog,
     QGroupBox, QCheckBox, QSpinBox, QTabWidget, QTableWidget,
-    QTableWidgetItem, QHeaderView, QProgressBar
+    QTableWidgetItem, QHeaderView, QProgressBar,QComboBox
 )
-from PyQt5.QtCore import Qt, QTimer, QByteArray
+from PyQt5.QtCore import Qt, QTimer, QByteArray,QObject,pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QFont, QColor
 
-# ============ Configuration ============
+# ============ Configuration ============\
+
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 5001
 RECV_BUFFER = 65536
@@ -50,8 +51,17 @@ def format_bytes(bytes_size):
     return f"{bytes_size:.2f} TB"
 
 # Constants (you can adjust)
-SCREENSHOT_QUALITY = 60      # JPEG quality
-SCREEN_SHARE_INTERVAL = 0.03  # seconds per frame (≈ 30 FPS)
+SCREENSHOT_QUALITY = 40      # Lower quality for speed
+SCREEN_SCALE = 0.5           # Scale to 50% 
+SCREEN_SHARE_FPS = 30        # Target FPS
+FRAME_BUFFER_SIZE = 3        # Keep only latest 3 frames per client
+PRESENTATION_FPS = 30           # Target frames per second
+PRESENTATION_QUALITY = 85       # JPEG quality (70-95 for high quality)
+PRESENTATION_SCALE = 1.0        # 1.0 = full resolution, 0.75 = 75% scale, 0.5 = 50% scale
+
+class ServerSignals(QObject):
+    """Qt signals for thread-safe UI updates"""
+    new_frame = pyqtSignal(str, bytes)  # client_key, frame_data
 
 # ============ Client Handler ============
 class ClientHandler:
@@ -86,54 +96,54 @@ class ClientHandler:
         self.client_socket = sock
         self.connected = True
 
-    def start_screen_share(self):
-        """Start continuous screen sharing"""
+    # def start_screen_share(self):
+    #     """Start continuous screen sharing"""
 
-        if not self.connected:
-            print("[❌] Cannot start screen sharing: not connected")
-            return
-        if getattr(self, "sharing_active", False):
-            print("[ℹ️] Screen sharing is already active")
-            return
+    #     if not self.connected:
+    #         print("[❌] Cannot start screen sharing: not connected")
+    #         return
+    #     if getattr(self, "sharing_active", False):
+    #         print("[ℹ️] Screen sharing is already active")
+    #         return
 
-        self.sharing_active = True
-        print("[🖥️] Starting screen sharing...")
+    #     self.sharing_active = True
+    #     print("[🖥️] Starting screen sharing...")
 
-        def share_loop():
-            with mss.mss() as sct:
-                monitor = sct.monitors[1]  # Primary display
-                while self.sharing_active and self.connected:
-                    try:
-                        frame = np.array(sct.grab(monitor))
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    #     def share_loop():
+    #         with mss.mss() as sct:
+    #             monitor = sct.monitors[1]  # Primary display
+    #             while self.sharing_active and self.connected:
+    #                 try:
+    #                     frame = np.array(sct.grab(monitor))
+    #                     frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
 
-                        # Encode frame in memory for streaming (not saving)
-                        success, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
-                        if not success:
-                            continue
+    #                     # Encode frame in memory for streaming (not saving)
+    #                     success, encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 50])
+    #                     if not success:
+    #                         continue
 
-                        data = encoded.tobytes()
-                        header = b"FRAME\n"
-                        size = struct.pack(">Q", len(data))
-                        self.client_socket.sendall(header + size + data)
+    #                     data = encoded.tobytes()
+    #                     header = b"FRAME\n"
+    #                     size = struct.pack(">Q", len(data))
+    #                     self.client_socket.sendall(header + size + data)
 
-                        # Optional: track stats
-                        self.frames_received = getattr(self, "frames_received", 0) + 1
-                        self.bytes_received = getattr(self, "bytes_received", 0) + len(data)
+    #                     # Optional: track stats
+    #                     self.frames_received = getattr(self, "frames_received", 0) + 1
+    #                     self.bytes_received = getattr(self, "bytes_received", 0) + len(data)
 
-                        # Control frame rate
-                        time.sleep(SCREEN_SHARE_INTERVAL)
+    #                     # Control frame rate
+    #                     time.sleep(SCREEN_SHARE_INTERVAL)
 
-                    except Exception as e:
-                        print(f"[⚠️] Screen share error: {e}")
-                        break
+    #                 except Exception as e:
+    #                     print(f"[⚠️] Screen share error: {e}")
+    #                     break
 
-            # Clean up after stopping
-            self.sharing_active = False
-            print("[🛑] Screen sharing stopped")
+    #         # Clean up after stopping
+    #         self.sharing_active = False
+    #         print("[🛑] Screen sharing stopped")
 
-        # Run in a separate thread
-        threading.Thread(target=share_loop, daemon=True).start()
+    #     # Run in a separate thread
+    #     threading.Thread(target=share_loop, daemon=True).start()
 
     def stop_screen_share(self):
         """Stop continuous screen sharing"""
@@ -222,12 +232,21 @@ class ClientHandler:
             return False
 
     def _reader_loop(self):
-        """Read data from client"""
+        """Optimized reader loop with better frame handling"""
         sock = self.sock
         sock.settimeout(30.0)
+        
+        # Set TCP_NODELAY for lower latency
+        try:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except:
+            pass
 
         try:
             buffer = b""
+            frame_count = 0
+            last_frame_time = time.time()
+            
             while self.running.is_set():
                 try:
                     data = sock.recv(RECV_BUFFER)
@@ -244,80 +263,90 @@ class ClientHandler:
                             continue
 
                         try:
-                            # Handle live screen frames (do NOT save)
                             if header.upper() == "FRAME":
-                                # Read 8-byte size
+                                # Read size header
                                 while len(buffer) < 8:
                                     chunk = sock.recv(RECV_BUFFER)
                                     if not chunk:
-                                        raise ConnectionError("Connection closed while reading frame size")
+                                        raise ConnectionError("Connection closed")
                                     buffer += chunk
 
-                                size_bytes = buffer[:8]
+                                size = struct.unpack(">Q", buffer[:8])[0]
                                 buffer = buffer[8:]
-                                size = struct.unpack(">Q", size_bytes)[0]
 
                                 if size <= 0 or size > MAX_IMAGE_SIZE:
-                                    self.server.log(f"⚠️ Invalid frame size from {self.key}: {size}")
+                                    self.server.log(f"⚠️ Invalid frame size: {size}")
                                     continue
 
                                 # Read frame data
                                 while len(buffer) < size:
-                                    chunk = sock.recv(min(RECV_BUFFER, size - len(buffer)))
+                                    needed = size - len(buffer)
+                                    chunk = sock.recv(min(RECV_BUFFER, needed))
                                     if not chunk:
-                                        raise ConnectionError("Connection closed while reading frame data")
+                                        raise ConnectionError("Connection closed")
                                     buffer += chunk
 
                                 frame_data = buffer[:size]
                                 buffer = buffer[size:]
 
-                                # Only show on UI, never save
-                                self.last_image = frame_data
-                                self.last_image_ts = time.time()
-                                self.frames_received += 1
+                                # Update stats
+                                frame_count += 1
+                                self.frames_received = frame_count
                                 self.bytes_received += len(frame_data)
+                                
+                                # Calculate FPS
+                                now = time.time()
+                                elapsed = now - last_frame_time
+                                
+                                # Frame skip logic: only process every Nth frame if too fast
+                                if elapsed < 0.02:  # Faster than 50 FPS
+                                    if frame_count % 2 != 0:  # Skip odd frames
+                                        continue
+                                
+                                last_frame_time = now
+                                self.last_image = frame_data
+                                self.last_image_ts = now
 
-                                if hasattr(self.server, "signals"):
-                                    self.server.signals.new_frame.emit(self.key, frame_data)
-                                else:
-                                    self.server.on_client_frame(self.key, frame_data)
+                                # Add to buffer (thread-safe)
+                                with self.server.frame_locks[self.key]:
+                                    self.server.frame_buffers[self.key].append(frame_data)
+                                
+                                # Emit signal for UI update
+                                self.server.signals.new_frame.emit(self.key, frame_data)
 
                             elif header.upper() == "HEARTBEAT":
                                 self.last_heartbeat = time.time()
 
                             elif header.upper().startswith("STATUS"):
-                                self.server.log(f"📊 Status from {self.key}: {header}")
+                                self.server.log(f"📊 {self.key}: {header}")
 
                             elif header.upper().startswith("MSG"):
-                                self.server.log(f"💬 Message from {self.key}: {header}")
+                                self.server.log(f"💬 {self.key}: {header}")
 
                             else:
-                                self.server.log(f"📢 From {self.key}: {header}")
+                                self.server.log(f"📢 {self.key}: {header}")
 
-                        except Exception as header_error:
-                            self.server.log(f"⚠️ Error processing header '{header}' from {self.key}: {header_error}")
+                        except Exception as e:
+                            self.server.log(f"⚠️ Header error '{header}': {e}")
                             continue
 
                 except socket.timeout:
                     if time.time() - self.last_heartbeat > 60:
-                        self.server.log(f"⏱️ Client {self.key} timed out")
+                        self.server.log(f"⏱️ {self.key} timed out")
                         break
                     continue
 
                 except Exception as e:
-                    self.server.log(f"⚠️ Read error from {self.key}: {e}")
-                    import traceback
-                    self.server.log(f"Traceback: {traceback.format_exc()}")
+                    self.server.log(f"⚠️ Read error {self.key}: {e}")
                     break
 
         except Exception as e:
-            self.server.log(f"❌ Handler error for {self.key}: {e}")
+            self.server.log(f"❌ Handler error {self.key}: {e}")
         finally:
             self.running.clear()
             self.client_info["status"] = "disconnected"
             self.server.log(f"❌ {self.key} disconnected")
             self.server.remove_client(self.key)
-
     def get_stats(self):
         """Get client statistics"""
         uptime = time.time() - self.connected_time
@@ -561,12 +590,152 @@ class AdminServer:
         self.clients = {}  # key -> ClientHandler
         self.clients_lock = threading.Lock()
         self.log_queue = Queue()
-        self.frame_queue = Queue()
         
-        # Statistics
+        # Optimized frame handling with per-client buffers
+        self.frame_buffers = defaultdict(lambda: deque(maxlen=FRAME_BUFFER_SIZE))
+        self.frame_locks = defaultdict(threading.Lock)
+        
+        self.signals = ServerSignals()
         self.total_connections = 0
         self.start_time = None
+        
+        # NEW: Presentation mode attributes
+        self.presenting = False
+        self.presentation_thread = None
+    # ============ ADMIN SIDE (admin_server.py) ============
 
+
+
+# 2. Add these methods to AdminServer class:
+    def start_presentation(self, target_keys):
+        """Start presenting admin screen to specific clients"""
+        if self.presenting:
+            self.log("Presentation already active")
+            return
+        
+        self.presenting = True
+        self.log(f"Starting presentation to {len(target_keys)} client(s)")
+        
+        # Send start presentation command
+        for key in target_keys:
+            with self.clients_lock:
+                if key in self.clients:
+                    try:
+                        self.clients[key].client_socket.sendall(b"START_PRESENTATION\n")
+                    except Exception as e:
+                        self.log(f"Failed to send START_PRESENTATION to {key}: {e}")
+        
+        # Start capture thread
+        self.presentation_thread = threading.Thread(
+            target=self._presentation_loop,
+            args=(target_keys,),
+            daemon=True
+        )
+        self.presentation_thread.start()
+
+    def stop_presentation(self):
+        """Stop presenting admin screen"""
+        if not self.presenting:
+            return
+        
+        self.presenting = False
+        self.log("Stopping presentation")
+        
+        # Send stop command to all clients
+        with self.clients_lock:
+            for handler in self.clients.values():
+                try:
+                    handler.client_socket.sendall(b"STOP_PRESENTATION\n")
+                except:
+                    pass
+
+    def _presentation_loop(self, target_keys):
+        """Capture and send admin's screen to clients - CONFIGURABLE HIGH QUALITY"""
+        with mss.mss() as sct:
+            monitor = sct.monitors[1]
+            
+            # Get settings (use defaults if not defined)
+            fps = getattr(self, 'presentation_fps', PRESENTATION_FPS)
+            quality = getattr(self, 'presentation_quality', PRESENTATION_QUALITY)
+            scale = getattr(self, 'presentation_scale', PRESENTATION_SCALE)
+            
+            frame_time = 1.0 / fps
+            
+            self.log(f"📽️ Presentation: {fps} FPS, Quality: {quality}, Scale: {scale*100:.0f}%")
+            
+            frame_count = 0
+            total_bytes = 0
+            start_time = time.time()
+            
+            while self.presenting:
+                loop_start = time.time()
+                
+                try:
+                    # Capture screen
+                    screenshot = sct.grab(monitor)
+                    frame = np.array(screenshot)
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                    
+                    # Apply scaling if needed
+                    if scale != 1.0:
+                        h, w = frame.shape[:2]
+                        new_size = (int(w * scale), int(h * scale))
+                        frame = cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
+                    
+                    # High quality compression
+                    encode_params = [
+                        cv2.IMWRITE_JPEG_QUALITY, quality,
+                        cv2.IMWRITE_JPEG_OPTIMIZE, 1,
+                        cv2.IMWRITE_JPEG_PROGRESSIVE, 1
+                    ]
+                    
+                    success, encoded = cv2.imencode('.jpg', frame, encode_params)
+                    
+                    if not success:
+                        continue
+                    
+                    data = encoded.tobytes()
+                    frame_count += 1
+                    total_bytes += len(data)
+                    
+                    # Send to clients
+                    header = b"PRESENT_FRAME\n" + struct.pack(">Q", len(data))
+                    
+                    failed_keys = []
+                    with self.clients_lock:
+                        for key in target_keys:
+                            if key in self.clients:
+                                try:
+                                    self.clients[key].client_socket.sendall(header + data)
+                                except Exception as e:
+                                    failed_keys.append(key)
+                    
+                    # Remove disconnected clients
+                    for key in failed_keys:
+                        if key in target_keys:
+                            target_keys.remove(key)
+                    
+                    # Log stats every 5 seconds
+                    if frame_count % (fps * 5) == 0:
+                        elapsed = time.time() - start_time
+                        actual_fps = frame_count / elapsed if elapsed > 0 else 0
+                        avg_size = total_bytes / frame_count if frame_count > 0 else 0
+                        self.log(f"📊 Presentation stats: {actual_fps:.1f} FPS, {avg_size/1024:.1f} KB/frame")
+                    
+                    # Maintain target FPS
+                    elapsed = time.time() - loop_start
+                    sleep_time = max(0, frame_time - elapsed)
+                    time.sleep(sleep_time)
+                    
+                except Exception as e:
+                    self.log(f"❌ Presentation error: {e}")
+                    break
+            
+            # Final stats
+            total_time = time.time() - start_time
+            avg_fps = frame_count / total_time if total_time > 0 else 0
+            self.log(f"📊 Presentation ended: {frame_count} frames, {avg_fps:.1f} avg FPS")
+            self.presenting = False
     def start(self):
         """Start the server"""
         if self.running.is_set():
@@ -804,7 +973,8 @@ class AdminWindow(QMainWindow):
         
         self._build_ui()
         self._start_timers()
-        
+        self.presenting = False
+        self.presentation_thread = None
     def log(self, message):
         """Write log message to console or admin log area"""
         print(message)  # or append to a QTextEdit if you have one
@@ -940,7 +1110,7 @@ class AdminWindow(QMainWindow):
         file_layout = QVBoxLayout(file_group)
         
         btn_send_file = QPushButton("📤 Send File to Selected")
-        btn_send_file.clicked.connect(self.send_file_to_selected)
+        btn_send_file.clicked.connect(self.send_to_selected)
         file_layout.addWidget(btn_send_file)
         
         btn_send_all = QPushButton("📤 Send File to All")
@@ -970,7 +1140,7 @@ class AdminWindow(QMainWindow):
         return widget
 
     def _create_monitor_tab(self):
-        """Create monitoring tab"""
+        """Create monitoring tab with Present Screen button"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
@@ -994,6 +1164,40 @@ class AdminWindow(QMainWindow):
         btn_refresh_preview = QPushButton("🔄 Refresh")
         btn_refresh_preview.clicked.connect(self.refresh_preview)
         controls.addWidget(btn_refresh_preview)
+        
+        # NEW: Quality settings group
+        quality_group = QGroupBox("Presentation Quality")
+        quality_layout = QHBoxLayout(quality_group)
+        
+        quality_layout.addWidget(QLabel("Quality:"))
+        self.quality_combo = QComboBox()
+        self.quality_combo.addItems(["High (85)", "Very High (95)", "Medium (70)", "Low (50)"])
+        self.quality_combo.setCurrentIndex(0)  # Default to High
+        quality_layout.addWidget(self.quality_combo)
+        
+        quality_layout.addWidget(QLabel("Scale:"))
+        self.scale_combo = QComboBox()
+        self.scale_combo.addItems(["100%", "75%", "50%"])
+        self.scale_combo.setCurrentIndex(0)  # Default to 100%
+        quality_layout.addWidget(self.scale_combo)
+        
+        controls.addWidget(quality_group)
+        
+        # Present Screen button
+        self.btn_present = QPushButton("📽️ Present My Screen")
+        self.btn_present.clicked.connect(self.toggle_presentation)
+        self.btn_present.setStyleSheet("""
+            QPushButton {
+                background-color: #107c10;
+                color: white;
+                font-weight: bold;
+                padding: 12px 24px;
+            }
+            QPushButton:hover {
+                background-color: #0e6b0e;
+            }
+        """)
+        controls.addWidget(self.btn_present)
         
         controls.addStretch()
         
@@ -1074,9 +1278,69 @@ class AdminWindow(QMainWindow):
         layout.addLayout(log_controls)
         
         return widget
-
+    def toggle_presentation(self):
+        """Toggle presentation mode with quality settings"""
+        if self.server.presenting:
+            # Stop presentation
+            self.server.stop_presentation()
+            self.btn_present.setText("📽️ Present My Screen")
+            self.btn_present.setStyleSheet("""
+                QPushButton {
+                    background-color: #107c10;
+                    color: white;
+                    font-weight: bold;
+                    padding: 12px 24px;
+                }
+                QPushButton:hover {
+                    background-color: #0e6b0e;
+                }
+            """)
+            self.server.log("Presentation stopped")
+        else:
+            # Start presentation
+            keys = self._get_selected_keys()
+            if not keys:
+                QMessageBox.warning(self, "No Selection", "Please select one or more clients to present to")
+                return
+            
+            # Get quality settings
+            quality_text = self.quality_combo.currentText()
+            quality = int(quality_text.split("(")[1].split(")")[0])
+            
+            scale_text = self.scale_combo.currentText()
+            scale = float(scale_text.replace("%", "")) / 100
+            
+            # Set server presentation settings
+            self.server.presentation_quality = quality
+            self.server.presentation_scale = scale
+            self.server.presentation_fps = 30
+            
+            reply = QMessageBox.question(
+                self,
+                "Start Presentation",
+                f"Present your screen to {len(keys)} selected client(s)?\n\n"
+                f"Quality: {quality}, Scale: {scale*100:.0f}%, FPS: 30\n"
+                "Their screens will be locked and show your screen.",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                self.server.start_presentation(keys)
+                self.btn_present.setText("⏹️ Stop Presenting")
+                self.btn_present.setStyleSheet("""
+                    QPushButton {
+                        background-color: #c42b1c;
+                        color: white;
+                        font-weight: bold;
+                        padding: 12px 24px;
+                    }
+                    QPushButton:hover {
+                        background-color: #a52a1a;
+                    }
+                """)
+                self.server.log(f"Started presenting: {quality} quality, {scale*100:.0f}% scale, 30 FPS")
     def _start_timers(self):
-        """Start update timers"""
+        """Start optimized update timers"""
         # Log drain timer
         self.timer_log = QTimer(self)
         self.timer_log.setInterval(200)
@@ -1095,10 +1359,10 @@ class AdminWindow(QMainWindow):
         self.timer_inbox.timeout.connect(self.refresh_inbox)
         self.timer_inbox.start()
         
-        # Frame update timer
+        # OPTIMIZED: Faster frame updates (60 FPS UI refresh)
         self.timer_frames = QTimer(self)
-        self.timer_frames.setInterval(100)
-        self.timer_frames.timeout.connect(self._update_frames)
+        self.timer_frames.setInterval(16)  # ~60 FPS
+        self.timer_frames.timeout.connect(self._update_frames_optimized)
         self.timer_frames.start()
         
         # Status update timer
@@ -1106,6 +1370,9 @@ class AdminWindow(QMainWindow):
         self.timer_status.setInterval(1000)
         self.timer_status.timeout.connect(self._update_status)
         self.timer_status.start()
+        
+        # Connect signal for thread-safe frame updates
+        self.server.signals.new_frame.connect(self._on_new_frame)
 
     def _drain_logs(self):
         """Drain log queue"""
@@ -1230,67 +1497,87 @@ class AdminWindow(QMainWindow):
         self.log(f"📨 Sent '{command}' to {sent}/{len(keys)} selected clients")
 
     # Add this method to AdminWindow class in admin.py:
+    def _on_new_frame(self, client_key, frame_data):
+        """Thread-safe frame handler"""
+        if client_key == self.selected_preview_client:
+            self._display_image_bytes(frame_data)
 
-    def send_file_to_selected(self):
-        """Send file to selected clients with destination choice"""
-        keys = self._get_selected_keys()
-        if not keys:
-            QMessageBox.warning(self, "No Selection", "Please select one or more clients")
+    def _update_frames_optimized(self):
+        """Optimized frame update from buffer"""
+        if not self.selected_preview_client:
             return
         
-        # Choose file
-        path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send")
-        if not path:
-            return
-        
-        # Show dialog for destination
-        destinations = [
-            "Downloads",
-            "Desktop",
-            "Documents",
-            "Custom Path..."
-        ]
-        
-        destination, ok = QInputDialog.getItem(
-            self,
-            "Select Destination",
-            "Where should the file be saved on the client?",
-            destinations,
-            0,
-            False
-        )
-        
-        if not ok:
-            return
-        
-        # If custom path selected, ask user to input it
-        if destination == "Custom Path...":
-            destination, ok = QInputDialog.getText(
-                self,
-                "Custom Destination",
-                "Enter the full path (e.g., C:\\Users\\Student\\Desktop or /home/user/Documents):",
-                text="C:\\"
-            )
-            if not ok or not destination:
+        # Get latest frame from buffer
+        with self.server.frame_locks[self.selected_preview_client]:
+            buffer = self.server.frame_buffers.get(self.selected_preview_client)
+            if buffer and len(buffer) > 0:
+                # Get most recent frame
+                frame_data = buffer[-1]
+                self._display_image_bytes(frame_data)
+
+    def _display_image_bytes(self, img_bytes: bytes):
+        """Display image from bytes (fallback method)"""
+        self._display_image_bytes(img_bytes)
+        def send_file_to_selected(self):
+            """Send file to selected clients with destination choice"""
+            keys = self._get_selected_keys()
+            if not keys:
+                QMessageBox.warning(self, "No Selection", "Please select one or more clients")
                 return
-        
-        # Send file to selected clients
-        with self.server.clients_lock:
-            sent = 0
-            for k in keys:
-                if k in self.server.clients:
-                    threading.Thread(
-                        target=self.server.clients[k].send_file,
-                        args=(path, destination),
-                        daemon=True
-                    ).start()
-                    sent += 1
-        
-        QMessageBox.information(
-            self,
-            "File Transfer",
-            f"Sending {os.path.basename(path)} to {sent} client(s)\nDestination: {destination}"
-        )
+            
+            # Choose file
+            path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send")
+            if not path:
+                return
+            
+            # Show dialog for destination
+            destinations = [
+                "Downloads",
+                "Desktop",
+                "Documents",
+                "Custom Path..."
+            ]
+            
+            destination, ok = QInputDialog.getItem(
+                self,
+                "Select Destination",
+                "Where should the file be saved on the client?",
+                destinations,
+                0,
+                False
+            )
+            
+            if not ok:
+                return
+            
+            # If custom path selected, ask user to input it
+            if destination == "Custom Path...":
+                destination, ok = QInputDialog.getText(
+                    self,
+                    "Custom Destination",
+                    "Enter the full path (e.g., C:\\Users\\Student\\Desktop or /home/user/Documents):",
+                    text="C:\\"
+                )
+                if not ok or not destination:
+                    return
+            
+            # Send file to selected clients
+            with self.server.clients_lock:
+                sent = 0
+                for k in keys:
+                    if k in self.server.clients:
+                        threading.Thread(
+                            target=self.server.clients[k].send_file,
+                            args=(path, destination),
+                            daemon=True
+                        ).start()
+                        sent += 1
+            
+            QMessageBox.information(
+                self,
+                "File Transfer",
+                f"Sending {os.path.basename(path)} to {sent} client(s)\nDestination: {destination}"
+            )
 
 
     def send_file_to_all(self):

@@ -14,13 +14,13 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout,
                              QPushButton, QMessageBox, QTextEdit, QProgressBar,
                              QHBoxLayout, QSystemTrayIcon, QMenu, QAction, QInputDialog)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject
-from PyQt5.QtGui import QPixmap, QIcon, QFont, QColor, QPalette
+from PyQt5.QtGui import QPixmap, QIcon, QFont, QColor, QPalette, QImage
 from PIL import ImageGrab
 
 # ==============================
 # Configuration
 # ==============================
-SERVER_HOST = '192.168.68.110'  # Change this to admin/teacher IP
+SERVER_HOST = '192.168.100.30'  # Change this to admin/teacher IP
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000  # milliseconds
@@ -31,7 +31,87 @@ SCREENSHOT_QUALITY = 60      # JPEG quality
 SCREEN_SHARE_INTERVAL = 0.03  # seconds per frame (≈ 30 FPS)
 
 
-
+class PresentationOverlay(QWidget):
+    """Fullscreen overlay that displays admin's presentation"""
+    
+    def __init__(self, parent=None):
+        super().__init__()
+        self.parent_window = parent
+        
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setFocusPolicy(Qt.StrongFocus)
+        
+        self.setStyleSheet("QWidget { background-color: #000000; }")
+        
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Image display
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("background-color: #000000;")
+        self.image_label.setText("📽️ Connecting to presentation...")
+        self.image_label.setFont(QFont("Segoe UI", 24))
+        self.image_label.setStyleSheet("color: white; background-color: #000000;")
+        layout.addWidget(self.image_label)
+        
+        # Info bar at bottom
+        info_layout = QHBoxLayout()
+        info_layout.setContentsMargins(20, 10, 20, 10)
+        
+        self.info_label = QLabel("📽️ Presentation Mode - Admin is presenting")
+        self.info_label.setStyleSheet("""
+            color: white;
+            background-color: rgba(0, 120, 212, 180);
+            padding: 8px 15px;
+            border-radius: 5px;
+            font-size: 14px;
+            font-weight: bold;
+        """)
+        info_layout.addWidget(self.info_label)
+        info_layout.addStretch()
+        
+        layout.addLayout(info_layout)
+        
+        self.setLayout(layout)
+    
+    def update_frame(self, image_data):
+        """Update the displayed frame"""
+        try:
+            from PyQt5.QtCore import QByteArray
+            qimg = QImage.fromData(QByteArray(image_data))
+            if not qimg.isNull():
+                pix = QPixmap.fromImage(qimg)
+                scaled = pix.scaled(
+                    self.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.image_label.setPixmap(scaled)
+        except Exception as e:
+            print(f"Error updating presentation frame: {e}")
+    
+    def showFullScreen(self):
+        """Show fullscreen"""
+        super().showFullScreen()
+        self.setFocus()
+        self.raise_()
+        self.activateWindow()
+    
+    def keyPressEvent(self, event):
+        """Block all key events except ESC for admin"""
+        event.ignore()
+    
+    def mousePressEvent(self, event):
+        """Block mouse clicks"""
+        event.ignore()
+    
+    def closeEvent(self, event):
+        """Handle close"""
+        event.accept()
+        
 class LockOverlay(QWidget):
     """Full-screen overlay that blocks all input and shows a lock message"""
     
@@ -241,7 +321,10 @@ class StudentClient(QWidget):
         # Start connection attempt
         self.log("Application started")
         QTimer.singleShot(500, self.attempt_connection)
-
+        self.presentation_overlay = None
+        self.presentation_signals = LockSignals()
+        self.presentation_signals.lock_requested.connect(self._show_presentation)
+        self.presentation_signals.unlock_requested.connect(self._hide_presentation)
     def setup_ui(self):
         """Setup the user interface"""
         main_layout = QVBoxLayout()
@@ -313,7 +396,35 @@ class StudentClient(QWidget):
         main_layout.addWidget(footer)
         
         self.setLayout(main_layout)
+        
+        
+ # -----------------------------------------------------------------------------------------------------------------------------       
+        # 3. Add these methods to StudentClient class:
+    def _show_presentation(self, _):
+        """Show presentation overlay (thread-safe)"""
+        if self.presentation_overlay is None:
+            self.log("Starting presentation mode")
+            self.presentation_overlay = PresentationOverlay(parent=self)
+            self.presentation_overlay.showFullScreen()
+            self.signals.update_status.emit("📽️ Viewing Presentation", "yellow")
 
+    def _hide_presentation(self):
+        """Hide presentation overlay (thread-safe)"""
+        if self.presentation_overlay:
+            self.log("Ending presentation mode")
+            self.presentation_overlay.close()
+            self.presentation_overlay = None
+            self.signals.update_status.emit("✅ Connected to Admin/Teacher Server", "green")
+
+    def update_presentation_frame(self, frame_data):
+        """Update presentation overlay with new frame"""
+        if self.presentation_overlay:
+            self.presentation_overlay.update_frame(frame_data)   
+            
+            
+# -----------------------------------------------------------------------------------------------------------------------------
+            
+            
     def setup_system_tray(self):
         """Setup system tray icon"""
         try:
@@ -495,11 +606,18 @@ class StudentClient(QWidget):
     def process_command(self, command):
         """Process received command"""
         print(f"[DEBUG] Received command: '{command}'")
+        
         if command == "LOCK":
-            print("[DEBUG] Lock command received, locking now.")
+            print("[DEBUG] Lock command received")
             self.lock_screen()
         elif command == "UNLOCK":
             self.unlock_screen()
+        elif command == "START_PRESENTATION":
+            print("[DEBUG] Start presentation command received")
+            self.presentation_signals.lock_requested.emit("")
+        elif command == "STOP_PRESENTATION":
+            print("[DEBUG] Stop presentation command received")
+            self.presentation_signals.unlock_requested.emit()
         elif command == "REQUEST_SCREEN":
             threading.Thread(target=self.send_screen_once, daemon=True).start()
         elif command == "START_SCREEN_STREAM":
@@ -507,7 +625,7 @@ class StudentClient(QWidget):
         elif command == "STOP_SCREEN_STREAM":
             self.stop_streaming_screen()
         elif command.startswith("MESSAGE:"):
-            msg = command[8:]  # Remove "MESSAGE:" prefix
+            msg = command[8:]
             self.signals.show_message.emit("Message from Admin", msg)
         elif command.startswith("SEND_FILE:"):
             filename = command.split(":", 1)[1]
@@ -676,7 +794,6 @@ class StudentClient(QWidget):
                 
                 buffer += data
                 
-                # Process complete commands/headers (ending with newline)
                 while b'\n' in buffer:
                     line, buffer = buffer.split(b'\n', 1)
                     command = line.decode('utf-8', errors='ignore').strip()
@@ -686,13 +803,40 @@ class StudentClient(QWidget):
                     
                     self.log(f"Received command: {command}")
                     
-                    # Check if this is a file transfer
-                    if command.upper() == "SEND_FILE":
-                        # File transfer incoming - handle in this thread
+                    # Handle presentation frames
+                    if command.upper() == "PRESENT_FRAME":
+                        # Read 8-byte size
+                        while len(buffer) < 8:
+                            chunk = self.client_socket.recv(BUFFER_SIZE)
+                            if not chunk:
+                                break
+                            buffer += chunk
+                        
+                        if len(buffer) < 8:
+                            continue
+                        
+                        size = struct.unpack(">Q", buffer[:8])[0]
+                        buffer = buffer[8:]
+                        
+                        # Read frame data
+                        while len(buffer) < size:
+                            needed = size - len(buffer)
+                            chunk = self.client_socket.recv(min(BUFFER_SIZE, needed))
+                            if not chunk:
+                                break
+                            buffer += chunk
+                        
+                        if len(buffer) >= size:
+                            frame_data = buffer[:size]
+                            buffer = buffer[size:]
+                            
+                            # Update presentation display
+                            self.update_presentation_frame(frame_data)
+                    
+                    elif command.upper() == "SEND_FILE":
                         self._receive_file_from_socket(buffer)
-                        buffer = b""  # Reset buffer after file transfer
+                        buffer = b""
                     else:
-                        # Regular command - process in separate thread
                         threading.Thread(
                             target=self.process_command,
                             args=(command,),
@@ -903,43 +1047,39 @@ class StudentClient(QWidget):
             self.share_screen_button.setText("🛑 Stop Screen Share")
 
     def start_screen_share(self):
-        """Start continuous screen sharing"""
-        if not self.connected:
-            self.log("Cannot start screen sharing: not connected")
-            QMessageBox.warning(self, "Connection", "Not connected to admin server.")
-            return
+        """Optimized screen sharing"""
         if getattr(self, 'sharing_active', False):
-            self.log("Screen sharing already active")
             return
-
+        
         self.sharing_active = True
-        self.log("Starting continuous screen sharing...")
-        self.signals.update_status.emit("🖥️ Screen sharing started", "blue")
-
+        
         def share_loop():
-            while self.sharing_active and self.connected:
-                try:
-                    screenshot = ImageGrab.grab()
-                    buffer = io.BytesIO()
-                    screenshot.save(buffer, format='JPEG', quality=SCREENSHOT_QUALITY, optimize=True)
-                    data = buffer.getvalue()
-
-                    header = b"FRAME\n"
-                    size = struct.pack(">Q", len(data))
-                    self.client_socket.sendall(header + size + data)
-
-                    # Control the frame rate
-                    time.sleep(SCREEN_SHARE_INTERVAL)
-
-                except Exception as e:
-                    self.log(f"Screen share error: {e}")
-                    break
-
-            # Clean up if stopped
-            self.sharing_active = False
-            self.log("Screen sharing stopped")
-            self.signals.update_status.emit("🛑 Screen sharing stopped", "red")
-
+            with mss.mss() as sct:
+                monitor = sct.monitors[1]
+                while self.sharing_active:
+                    try:
+                        # Capture
+                        frame = np.array(sct.grab(monitor))
+                        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+                        
+                        # Scale down (50%)
+                        h, w = frame.shape[:2]
+                        frame = cv2.resize(frame, (w//2, h//2), interpolation=cv2.INTER_LINEAR)
+                        
+                        # Compress (quality 40)
+                        _, encoded = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 40])
+                        data = encoded.tobytes()
+                        
+                        # Send with header
+                        header = b"FRAME\n" + struct.pack(">Q", len(data))
+                        self.sock.sendall(header + data)
+                        
+                        # 30 FPS
+                        time.sleep(0.033)
+                        
+                    except:
+                        break
+        
         threading.Thread(target=share_loop, daemon=True).start()
 
     def stop_screen_share(self):
