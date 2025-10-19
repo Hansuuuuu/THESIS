@@ -18,7 +18,8 @@ from PIL import ImageGrab, Image
 from datetime import datetime
 from queue import Queue, Empty
 from collections import defaultdict
-
+import hashlib
+from collections import deque
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QListWidgetItem, QFileDialog,
@@ -30,7 +31,10 @@ from PyQt5.QtCore import Qt, QTimer, QByteArray,QObject,pyqtSignal
 from PyQt5.QtGui import QPixmap, QImage, QFont, QColor
 
 # ============ Configuration ============\
-
+FILE_TRANSFER_BUFFER = 1024 * 1024 * 4  # 4MB chunks
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for resumable transfers
+RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache")
+os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 5001
 RECV_BUFFER = 65536
@@ -59,6 +63,99 @@ PRESENTATION_FPS = 30           # Target frames per second
 PRESENTATION_QUALITY = 85       # JPEG quality (70-95 for high quality)
 PRESENTATION_SCALE = 1.0        # 1.0 = full resolution, 0.75 = 75% scale, 0.5 = 50% scale
 
+# ------------------------------------------------------------------------------
+class ResumableFileTransfer:
+    """Handles resumable file transfers with checksums"""
+    
+    def __init__(self, filepath, destination, transfer_id=None):
+        self.filepath = filepath
+        self.destination = destination
+        self.filesize = os.path.getsize(filepath)
+        self.basename = os.path.basename(filepath)
+        
+        # Generate unique transfer ID based on file path and size
+        self.transfer_id = transfer_id or self._generate_transfer_id()
+        
+        # Calculate total chunks
+        self.total_chunks = (self.filesize + CHUNK_SIZE - 1) // CHUNK_SIZE
+        
+        # Metadata file for tracking progress
+        self.metadata_file = os.path.join(
+            RESUME_METADATA_DIR, 
+            f"{self.transfer_id}.json"
+        )
+        
+        # Load or initialize progress
+        self.completed_chunks = set()
+        self.chunk_checksums = {}
+        self._load_progress()
+    
+    def _generate_transfer_id(self):
+        """Generate unique transfer ID"""
+        unique_str = f"{self.filepath}_{self.filesize}_{int(time.time())}"
+        return hashlib.sha256(unique_str.encode()).hexdigest()[:16]
+    
+    def _calculate_chunk_checksum(self, data):
+        """Calculate SHA256 checksum for chunk"""
+        return hashlib.sha256(data).hexdigest()
+    
+    def _load_progress(self):
+        """Load transfer progress from metadata file"""
+        try:
+            if os.path.exists(self.metadata_file):
+                with open(self.metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                    self.completed_chunks = set(metadata.get('completed_chunks', []))
+                    self.chunk_checksums = metadata.get('chunk_checksums', {})
+        except Exception as e:
+            print(f"⚠️ Could not load progress: {e}")
+            self.completed_chunks = set()
+            self.chunk_checksums = {}
+    
+    def _save_progress(self):
+        """Save transfer progress to metadata file"""
+        try:
+            metadata = {
+                'transfer_id': self.transfer_id,
+                'filepath': self.filepath,
+                'destination': self.destination,
+                'filesize': self.filesize,
+                'total_chunks': self.total_chunks,
+                'completed_chunks': list(self.completed_chunks),
+                'chunk_checksums': self.chunk_checksums,
+                'last_update': time.time()
+            }
+            with open(self.metadata_file, 'w') as f:
+                json.dump(metadata, f)
+        except Exception as e:
+            print(f"⚠️ Could not save progress: {e}")
+    
+    def get_pending_chunks(self):
+        """Get list of chunks that still need to be sent"""
+        return [i for i in range(self.total_chunks) if i not in self.completed_chunks]
+    
+    def mark_chunk_complete(self, chunk_index, checksum):
+        """Mark a chunk as successfully transferred"""
+        self.completed_chunks.add(chunk_index)
+        self.chunk_checksums[str(chunk_index)] = checksum
+        self._save_progress()
+    
+    def is_complete(self):
+        """Check if transfer is complete"""
+        return len(self.completed_chunks) == self.total_chunks
+    
+    def get_progress(self):
+        """Get transfer progress percentage"""
+        return (len(self.completed_chunks) / self.total_chunks) * 100 if self.total_chunks > 0 else 0
+    
+    def cleanup(self):
+        """Remove metadata file after successful transfer"""
+        try:
+            if os.path.exists(self.metadata_file):
+                os.remove(self.metadata_file)
+        except:
+            pass
+# ---------------------------------------------------------------------------------------------------------------
 class ServerSignals(QObject):
     """Qt signals for thread-safe UI updates"""
     new_frame = pyqtSignal(str, bytes)  # client_key, frame_data
@@ -179,73 +276,167 @@ class ClientHandler:
             self.server.log(f"❌ Send error to {self.key}: {e}")
             return False
 
-    def send_file(self, filepath: str, destination: str = None):
-        """Send file to client with optional destination path"""
+    # In admin_server.py, ClientHandler class:
+
+    # In ClientHandler class, update send_file_resumable method:
+
+    def send_file_resumable(self, filepath: str, destination: str = None):
+        """Send file with resume capability - FIXED VERSION"""
         if not os.path.exists(filepath):
             self.server.log(f"❌ File not found: {filepath}")
             return False
         
         try:
-            basename = os.path.basename(filepath)
-            filesize = os.path.getsize(filepath)
+            transfer = ResumableFileTransfer(filepath, destination or "Downloads")
+            basename = transfer.basename
+            filesize = transfer.filesize
             
-            # Default to Downloads if no destination specified
-            if not destination:
-                destination = "Downloads"
+            self.server.log(f"📤 Starting transfer: {basename} ({format_bytes(filesize)})")
             
-            self.server.log(f"📤 Sending {basename} ({format_bytes(filesize)}) to {self.key} -> {destination}")
+            # Check resume status
+            pending_chunks = transfer.get_pending_chunks()
+            if len(pending_chunks) < transfer.total_chunks:
+                self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} chunks done")
             
-            # Create metadata JSON with destination info
-            metadata = {
+            # Optimize socket
+            try:
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8 * 1024 * 1024)
+            except:
+                pass
+            
+            # Send header
+            init_header = {
+                "command": "RESUMABLE_TRANSFER_START",
+                "transfer_id": transfer.transfer_id,
                 "filename": basename,
-                "destination": destination,
-                "timestamp": int(time.time())
+                "destination": transfer.destination,
+                "filesize": filesize,
+                "total_chunks": transfer.total_chunks,
+                "chunk_size": CHUNK_SIZE
             }
-            meta_json = json.dumps(metadata).encode('utf-8')
             
-            # Protocol: "SEND_FILE\n" + metadata_length(4 bytes) + metadata + file_data
-            header = b"SEND_FILE\n"
-            meta_len = struct.pack(">I", len(meta_json))
+            init_json = json.dumps(init_header).encode('utf-8')
+            header = b"RESUMABLE_FILE\n" + struct.pack(">I", len(init_json)) + init_json
             
             with self.lock:
                 self.sock.sendall(header)
-                self.sock.sendall(meta_len)
-                self.sock.sendall(meta_json)
-                time.sleep(0.05)
                 
-                sent = 0
+                # Wait for READY with timeout
+                self.sock.settimeout(15.0)
+                try:
+                    ack = self.sock.recv(1024)
+                    if b"READY" not in ack:
+                        raise Exception(f"Client not ready: {ack}")
+                    self.server.log("✅ Client READY")
+                except socket.timeout:
+                    raise Exception("Timeout waiting for READY")
+                finally:
+                    self.sock.settimeout(None)
+                
+                # Send chunks
+                start_time = time.time()
+                sent_bytes = 0
+                
                 with open(filepath, "rb") as f:
-                    while True:
-                        chunk = f.read(RECV_BUFFER)
-                        if not chunk:
-                            break
-                        self.sock.sendall(chunk)
-                        sent += len(chunk)
+                    for chunk_index in pending_chunks:
+                        try:
+                            # Read chunk
+                            f.seek(chunk_index * CHUNK_SIZE)
+                            chunk_data = f.read(CHUNK_SIZE)
+                            if not chunk_data:
+                                break
+                            
+                            # Calculate checksum
+                            checksum = transfer._calculate_chunk_checksum(chunk_data)
+                            
+                            # Send chunk header + data
+                            chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
+                            chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
+                            self.sock.sendall(chunk_header + chunk_data)
+                            
+                            # Wait for ACK with short timeout
+                            self.sock.settimeout(5.0)
+                            try:
+                                chunk_ack = self.sock.recv(32)
+                                if b"CHUNK_OK" not in chunk_ack:
+                                    raise Exception(f"Chunk {chunk_index} failed")
+                            except socket.timeout:
+                                raise Exception(f"Timeout on chunk {chunk_index}")
+                            finally:
+                                self.sock.settimeout(None)
+                            
+                            # Mark complete
+                            transfer.mark_chunk_complete(chunk_index, checksum)
+                            sent_bytes += len(chunk_data)
+                            
+                            # Log progress every 2 seconds
+                            if time.time() - start_time >= 2.0:
+                                progress = transfer.get_progress()
+                                speed = sent_bytes / (time.time() - start_time)
+                                self.server.log(f"📊 {progress:.1f}% | {format_bytes(speed)}/s")
+                                start_time = time.time()
+                                sent_bytes = 0
+                        
+                        except Exception as e:
+                            self.server.log(f"❌ Chunk {chunk_index} error: {e}")
+                            raise
                 
-                self.sock.sendall(b"<END>")
+                # ✅ FIX: Send completion WITHOUT waiting for response
+                self.sock.sendall(b"TRANSFER_COMPLETE\n")
+                
+                # ✅ FIX: DON'T read VERIFIED here - let _reader_loop handle it
+                # The main reader loop will naturally see the VERIFIED response
             
-            self.server.log(f"✅ File sent successfully: {basename}")
+            elapsed = time.time() - start_time
+            speed = filesize / elapsed if elapsed > 0 else 0
+            self.server.log(f"✅ Complete: {basename} | {format_bytes(speed)}/s")
+            
+            transfer.cleanup()
             return True
             
         except Exception as e:
-            self.server.log(f"❌ File send error: {e}")
+            self.server.log(f"❌ Transfer error: {e}")
+            self.server.log("💾 Progress saved - can resume")
             return False
 
+    def resume_file_transfer(self, transfer_id: str):
+        """Resume a previously interrupted transfer"""
+        try:
+            metadata_file = os.path.join(RESUME_METADATA_DIR, f"{transfer_id}.json")
+            
+            if not os.path.exists(metadata_file):
+                self.server.log(f"❌ No saved progress for transfer ID: {transfer_id}")
+                return False
+            
+            # Load metadata
+            with open(metadata_file, 'r') as f:
+                metadata = json.load(f)
+            
+            filepath = metadata['filepath']
+            destination = metadata['destination']
+            
+            self.server.log(f"🔄 Resuming transfer: {os.path.basename(filepath)}")
+            
+            # Resume transfer
+            return self.send_file(filepath, destination)
+            
+        except Exception as e:
+            self.server.log(f"❌ Resume transfer error: {e}")
+            return False
+
+
+    # In admin_server.py, update ClientHandler._reader_loop to handle socket errors gracefully:
+
     def _reader_loop(self):
-        """Optimized reader loop with better frame handling"""
+        """Read data from client"""
         sock = self.sock
         sock.settimeout(30.0)
-        
-        # Set TCP_NODELAY for lower latency
-        try:
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-        except:
-            pass
 
         try:
             buffer = b""
-            frame_count = 0
-            last_frame_time = time.time()
+            consecutive_errors = 0
+            max_consecutive_errors = 3
             
             while self.running.is_set():
                 try:
@@ -254,6 +445,8 @@ class ClientHandler:
                         self.server.log(f"⚠️ Client {self.key} closed connection")
                         break
 
+                    # Reset error counter
+                    consecutive_errors = 0
                     buffer += data
 
                     while b'\n' in buffer:
@@ -263,85 +456,92 @@ class ClientHandler:
                             continue
 
                         try:
+                            # ✅ Handle live screen frames (do NOT save)
                             if header.upper() == "FRAME":
-                                # Read size header
+                                # Read 8-byte size
                                 while len(buffer) < 8:
                                     chunk = sock.recv(RECV_BUFFER)
                                     if not chunk:
-                                        raise ConnectionError("Connection closed")
+                                        raise ConnectionError("Connection closed while reading frame size")
                                     buffer += chunk
 
-                                size = struct.unpack(">Q", buffer[:8])[0]
+                                size_bytes = buffer[:8]
                                 buffer = buffer[8:]
+                                size = struct.unpack(">Q", size_bytes)[0]
 
                                 if size <= 0 or size > MAX_IMAGE_SIZE:
-                                    self.server.log(f"⚠️ Invalid frame size: {size}")
+                                    self.server.log(f"⚠️ Invalid frame size from {self.key}: {size}")
                                     continue
 
                                 # Read frame data
                                 while len(buffer) < size:
-                                    needed = size - len(buffer)
-                                    chunk = sock.recv(min(RECV_BUFFER, needed))
+                                    chunk = sock.recv(min(RECV_BUFFER, size - len(buffer)))
                                     if not chunk:
-                                        raise ConnectionError("Connection closed")
+                                        raise ConnectionError("Connection closed while reading frame data")
                                     buffer += chunk
 
                                 frame_data = buffer[:size]
                                 buffer = buffer[size:]
 
-                                # Update stats
-                                frame_count += 1
-                                self.frames_received = frame_count
-                                self.bytes_received += len(frame_data)
-                                
-                                # Calculate FPS
-                                now = time.time()
-                                elapsed = now - last_frame_time
-                                
-                                # Frame skip logic: only process every Nth frame if too fast
-                                if elapsed < 0.02:  # Faster than 50 FPS
-                                    if frame_count % 2 != 0:  # Skip odd frames
-                                        continue
-                                
-                                last_frame_time = now
+                                # ✅ Only show on UI, never save
                                 self.last_image = frame_data
-                                self.last_image_ts = now
+                                self.last_image_ts = time.time()
+                                self.frames_received += 1
+                                self.bytes_received += len(frame_data)
 
-                                # Add to buffer (thread-safe)
-                                with self.server.frame_locks[self.key]:
-                                    self.server.frame_buffers[self.key].append(frame_data)
-                                
-                                # Emit signal for UI update
-                                self.server.signals.new_frame.emit(self.key, frame_data)
+                                if hasattr(self.server, "signals"):
+                                    self.server.signals.new_frame.emit(self.key, frame_data)
+                                else:
+                                    self.server.on_client_frame(self.key, frame_data)
 
                             elif header.upper() == "HEARTBEAT":
                                 self.last_heartbeat = time.time()
 
                             elif header.upper().startswith("STATUS"):
-                                self.server.log(f"📊 {self.key}: {header}")
+                                self.server.log(f"📊 Status from {self.key}: {header}")
 
                             elif header.upper().startswith("MSG"):
-                                self.server.log(f"💬 {self.key}: {header}")
+                                self.server.log(f"💬 Message from {self.key}: {header}")
 
                             else:
-                                self.server.log(f"📢 {self.key}: {header}")
+                                self.server.log(f"📝 From {self.key}: {header}")
 
-                        except Exception as e:
-                            self.server.log(f"⚠️ Header error '{header}': {e}")
+                        except ConnectionError as ce:
+                            self.server.log(f"⚠️ Connection error processing header from {self.key}: {ce}")
+                            break
+                        except Exception as header_error:
+                            self.server.log(f"⚠️ Error processing header '{header}' from {self.key}: {header_error}")
                             continue
 
                 except socket.timeout:
                     if time.time() - self.last_heartbeat > 60:
-                        self.server.log(f"⏱️ {self.key} timed out")
+                        self.server.log(f"⏱️ Client {self.key} timed out")
                         break
                     continue
 
-                except Exception as e:
-                    self.server.log(f"⚠️ Read error {self.key}: {e}")
+                except ConnectionResetError:
+                    self.server.log(f"⚠️ Connection reset by {self.key}")
                     break
+                except ConnectionAbortedError:
+                    self.server.log(f"⚠️ Connection aborted by {self.key}")
+                    break
+                except OSError as e:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        self.server.log(f"⚠️ Too many socket errors from {self.key}: {e}")
+                        break
+                    time.sleep(0.1)
+                except Exception as e:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        self.server.log(f"⚠️ Read error from {self.key}: {e}")
+                        import traceback
+                        self.server.log(f"Traceback: {traceback.format_exc()}")
+                        break
+                    time.sleep(0.1)
 
         except Exception as e:
-            self.server.log(f"❌ Handler error {self.key}: {e}")
+            self.server.log(f"❌ Handler error for {self.key}: {e}")
         finally:
             self.running.clear()
             self.client_info["status"] = "disconnected"
@@ -1078,11 +1278,11 @@ class AdminWindow(QMainWindow):
         lock_layout.addWidget(btn_unlock_all)
         
         btn_lock_selected = QPushButton("🔒 Lock Selected")
-        btn_lock_selected.clicked.connect(lambda: self.send_to_selected("LOCK"))
+        btn_lock_selected.clicked.connect(lambda: self.send_command_to_selected("LOCK"))
         lock_layout.addWidget(btn_lock_selected)
         
         btn_unlock_selected = QPushButton("🔓 Unlock Selected")
-        btn_unlock_selected.clicked.connect(lambda: self.send_to_selected("UNLOCK"))
+        btn_unlock_selected.clicked.connect(lambda: self.send_command_to_selected("UNLOCK"))
         lock_layout.addWidget(btn_unlock_selected)
         
         right_layout.addWidget(lock_group)
@@ -1092,15 +1292,15 @@ class AdminWindow(QMainWindow):
         monitor_layout = QVBoxLayout(monitor_group)
         
         btn_screenshot = QPushButton("📸 Request Screenshot")
-        btn_screenshot.clicked.connect(lambda: self.send_to_selected("REQUEST_SCREEN"))
+        btn_screenshot.clicked.connect(lambda: self.send_command_to_selected("REQUEST_SCREEN"))
         monitor_layout.addWidget(btn_screenshot)
         
         btn_start_stream = QPushButton("▶️ Start Live View")
-        btn_start_stream.clicked.connect(lambda: self.send_to_selected("START_SCREEN_STREAM"))
+        btn_start_stream.clicked.connect(lambda: self.send_command_to_selected("START_SCREEN_STREAM"))
         monitor_layout.addWidget(btn_start_stream)
         
         btn_stop_stream = QPushButton("⏹️ Stop Live View")
-        btn_stop_stream.clicked.connect(lambda: self.send_to_selected("STOP_SCREEN_STREAM"))
+        btn_stop_stream.clicked.connect(lambda: self.send_command_to_selected("STOP_SCREEN_STREAM"))
         monitor_layout.addWidget(btn_stop_stream)
         
         right_layout.addWidget(monitor_group)
@@ -1110,7 +1310,7 @@ class AdminWindow(QMainWindow):
         file_layout = QVBoxLayout(file_group)
         
         btn_send_file = QPushButton("📤 Send File to Selected")
-        btn_send_file.clicked.connect(self.send_to_selected)
+        btn_send_file.clicked.connect(self.send_file_to_selected)  # FIXED: Direct method call
         file_layout.addWidget(btn_send_file)
         
         btn_send_all = QPushButton("📤 Send File to All")
@@ -1138,6 +1338,27 @@ class AdminWindow(QMainWindow):
         layout.addWidget(right_group, 1)
         
         return widget
+
+
+    # Add this new method to AdminWindow class:
+    def send_command_to_selected(self, command):
+        """Send a specific command to selected clients"""
+        keys = self._get_selected_keys()
+        if not keys:
+            QMessageBox.warning(self, "No Selection", "Please select one or more clients")
+            return
+
+        sent = 0
+        with self.server.clients_lock:
+            for k in keys:
+                if k in self.server.clients:
+                    try:
+                        self.server.clients[k].client_socket.sendall((command + "\n").encode())
+                        sent += 1
+                    except Exception as e:
+                        self.server.log(f"❌ Failed to send '{command}' to {k}: {e}")
+
+        self.server.log(f"📨 Sent '{command}' to {sent}/{len(keys)} selected clients")
 
     def _create_monitor_tab(self):
         """Create monitoring tab with Present Screen button"""
@@ -1477,13 +1698,121 @@ class AdminWindow(QMainWindow):
         """Get selected client keys"""
         return [it.text().replace("💻 ", "") for it in self.lst_clients.selectedItems()]
 
-    def send_to_selected(self, command):
-        """Send command to selected clients only"""
+    def send_to_selected(self, command=None):
+        """DEPRECATED: Use send_command_to_selected or send_file_to_selected instead"""
+        if command:
+            self.send_command_to_selected(command)
+        else:
+            self.send_file_to_selected()
+
+        # Add this method to AdminWindow class in admin.py:
+    def _on_new_frame(self, client_key, frame_data):
+            """Thread-safe frame handler"""
+            if client_key == self.selected_preview_client:
+                self._display_image_bytes(frame_data)
+
+    def _update_frames_optimized(self):
+            """Optimized frame update from buffer"""
+            if not self.selected_preview_client:
+                return
+            
+            # Get latest frame from buffer
+            with self.server.frame_locks[self.selected_preview_client]:
+                buffer = self.server.frame_buffers.get(self.selected_preview_client)
+                if buffer and len(buffer) > 0:
+                    # Get most recent frame
+                    frame_data = buffer[-1]
+                    self._display_image_bytes(frame_data)
+# =======================================================================================
+    def send_file_to_selected(self):
+        """Send file to selected clients with destination choice"""
+        keys = self._get_selected_keys()
+        if not keys:
+            QMessageBox.warning(self, "No Selection", "Please select one or more clients")
+            return
+        
+        # Choose file
+        path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send")
+        if not path:
+            return
+        
+        # Show dialog for destination
+        destinations = ["Downloads", "Desktop", "Documents", "Custom Path..."]
+        
+        destination, ok = QInputDialog.getItem(
+            self, "Select Destination",
+            "Where should the file be saved on the client?",
+            destinations, 0, False
+        )
+        
+        if not ok:
+            return
+        
+        if destination == "Custom Path...":
+            destination, ok = QInputDialog.getText(
+                self, "Custom Destination",
+                "Enter the full path:",
+                text="C:\\"
+            )
+            if not ok or not destination:
+                return
+        
+        filesize = os.path.getsize(path)
+        
+        # Send file to selected clients using resumable transfer
+        with self.server.clients_lock:
+            sent = 0
+            for k in keys:
+                if k in self.server.clients:
+                    threading.Thread(
+                        target=self.server.clients[k].send_file_resumable,  # FIXED
+                        args=(path, destination),       
+                        daemon=True
+                    ).start()
+                    sent += 1
+        
+        QMessageBox.information(
+            self, "File Transfer",
+            f"Starting transfer:\n"
+            f"File: {os.path.basename(path)} ({format_bytes(filesize)})\n"
+            f"Recipients: {sent} client(s)\n"
+            f"Destination: {destination}"
+        )
+
+    def list_resumable_transfers(self):
+        """List all resumable transfers in progress"""
+        try:
+            transfers = []
+            for filename in os.listdir(RESUME_METADATA_DIR):
+                if filename.endswith('.json'):
+                    filepath = os.path.join(RESUME_METADATA_DIR, filename)
+                    try:
+                        with open(filepath, 'r') as f:
+                            metadata = json.load(f)
+                            transfers.append(metadata)
+                    except:
+                        pass
+            return transfers
+        except:
+            return []
+# ==============================================================================================
+    def _display_image_bytes(self, img_bytes: bytes):
+        """Display image from bytes (fallback method)"""
+        self._display_image_bytes(img_bytes)
+        
+    def send_to_selected(self, command=None):
+        """Send command to selected clients or initiate file transfer"""
         keys = self._get_selected_keys()
         if not keys:
             QMessageBox.warning(self, "No Selection", "Please select one or more clients")
             return
 
+        # If no command provided, this is a file transfer request
+        if command is None:
+            self.send_file_to_selected_resumable()
+            return
+
+        # Send command to selected clients
         sent = 0
         with self.server.clients_lock:
             for k in keys:
@@ -1492,103 +1821,21 @@ class AdminWindow(QMainWindow):
                         self.server.clients[k].client_socket.sendall((command + "\n").encode())
                         sent += 1
                     except Exception as e:
-                        self.log(f"❌ Failed to send '{command}' to {k}: {e}")
+                        self.server.log(f"❌ Failed to send '{command}' to {k}: {e}")
 
-        self.log(f"📨 Sent '{command}' to {sent}/{len(keys)} selected clients")
-
-    # Add this method to AdminWindow class in admin.py:
-    def _on_new_frame(self, client_key, frame_data):
-        """Thread-safe frame handler"""
-        if client_key == self.selected_preview_client:
-            self._display_image_bytes(frame_data)
-
-    def _update_frames_optimized(self):
-        """Optimized frame update from buffer"""
-        if not self.selected_preview_client:
-            return
-        
-        # Get latest frame from buffer
-        with self.server.frame_locks[self.selected_preview_client]:
-            buffer = self.server.frame_buffers.get(self.selected_preview_client)
-            if buffer and len(buffer) > 0:
-                # Get most recent frame
-                frame_data = buffer[-1]
-                self._display_image_bytes(frame_data)
-
-    def _display_image_bytes(self, img_bytes: bytes):
-        """Display image from bytes (fallback method)"""
-        self._display_image_bytes(img_bytes)
-        def send_file_to_selected(self):
-            """Send file to selected clients with destination choice"""
-            keys = self._get_selected_keys()
-            if not keys:
-                QMessageBox.warning(self, "No Selection", "Please select one or more clients")
-                return
-            
-            # Choose file
-            path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send")
-            if not path:
-                return
-            
-            # Show dialog for destination
-            destinations = [
-                "Downloads",
-                "Desktop",
-                "Documents",
-                "Custom Path..."
-            ]
-            
-            destination, ok = QInputDialog.getItem(
-                self,
-                "Select Destination",
-                "Where should the file be saved on the client?",
-                destinations,
-                0,
-                False
-            )
-            
-            if not ok:
-                return
-            
-            # If custom path selected, ask user to input it
-            if destination == "Custom Path...":
-                destination, ok = QInputDialog.getText(
-                    self,
-                    "Custom Destination",
-                    "Enter the full path (e.g., C:\\Users\\Student\\Desktop or /home/user/Documents):",
-                    text="C:\\"
-                )
-                if not ok or not destination:
-                    return
-            
-            # Send file to selected clients
-            with self.server.clients_lock:
-                sent = 0
-                for k in keys:
-                    if k in self.server.clients:
-                        threading.Thread(
-                            target=self.server.clients[k].send_file,
-                            args=(path, destination),
-                            daemon=True
-                        ).start()
-                        sent += 1
-            
-            QMessageBox.information(
-                self,
-                "File Transfer",
-                f"Sending {os.path.basename(path)} to {sent} client(s)\nDestination: {destination}"
-            )
+        self.server.log(f"📨 Sent '{command}' to {sent}/{len(keys)} selected clients")
 
 
-    def send_file_to_all(self):
-        """Send file to all clients with destination choice"""
-        path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send to All")
-        if not path:
-            return
-        
-        keys = self.server.list_clients()
+    def send_file_to_selected(self):
+        """Send file to selected clients with destination choice"""
+        keys = self._get_selected_keys()
         if not keys:
-            QMessageBox.warning(self, "No Clients", "No connected clients")
+            QMessageBox.warning(self, "No Selection", "Please select one or more clients")
+            return
+        
+        # Choose file
+        path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send")
+        if not path:
             return
         
         # Show dialog for destination
@@ -1602,7 +1849,7 @@ class AdminWindow(QMainWindow):
         destination, ok = QInputDialog.getItem(
             self,
             "Select Destination",
-            "Where should the file be saved on all clients?",
+            "Where should the file be saved on the client?",
             destinations,
             0,
             False
@@ -1622,20 +1869,86 @@ class AdminWindow(QMainWindow):
             if not ok or not destination:
                 return
         
-        # Send file to all clients
+        # Determine which transfer method to use based on file size
+        filesize = os.path.getsize(path)
+        use_resumable = filesize > 100 * 1024 * 1024  # Use resumable for files > 100MB
+        
+        # Send file to selected clients
+        with self.server.clients_lock:
+            sent = 0
+            for k in keys:
+                if k in self.server.clients:
+                    if use_resumable:
+                        threading.Thread(
+                            target=self.server.clients[k].send_file_resumable,
+                            args=(path, destination),
+                            daemon=True
+                        ).start()
+                    else:
+                        threading.Thread(
+                            target=self.server.clients[k].send_file_resumable,
+                            args=(path, destination),
+                            daemon=True
+                        ).start()
+                    sent += 1
+        
+        transfer_type = "Resumable" if use_resumable else "Standard"
+        QMessageBox.information(
+            self,
+            "File Transfer",
+            f"{transfer_type} transfer started:\n"
+            f"File: {os.path.basename(path)} ({format_bytes(filesize)})\n"
+            f"Recipients: {sent} client(s)\n"
+            f"Destination: {destination}"
+        )
+
+    def send_file_to_all(self):
+        """Send file to all clients with destination choice"""
+        path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send to All")
+        if not path:
+            return
+        
+        keys = self.server.list_clients()
+        if not keys:
+            QMessageBox.warning(self, "No Clients", "No connected clients")
+            return
+        
+        # Show dialog for destination
+        destinations = ["Downloads", "Desktop", "Documents", "Custom Path..."]
+        
+        destination, ok = QInputDialog.getItem(
+            self, "Select Destination",
+            "Where should the file be saved on all clients?",
+            destinations, 0, False
+        )
+        
+        if not ok:
+            return
+        
+        if destination == "Custom Path...":
+            destination, ok = QInputDialog.getText(
+                self, "Custom Destination",
+                "Enter the full path:",
+                text="C:\\"
+            )
+            if not ok or not destination:
+                return
+        
+        # Send file to all clients using resumable transfer
         with self.server.clients_lock:
             for k in keys:
                 if k in self.server.clients:
                     threading.Thread(
-                        target=self.server.clients[k].send_file,
+                        target=self.server.clients[k].send_file_resumable,  # FIXED
                         args=(path, destination),
                         daemon=True
                     ).start()
         
+        filesize = os.path.getsize(path)
         QMessageBox.information(
-            self,
-            "File Transfer",
-            f"Sending {os.path.basename(path)} to {len(keys)} client(s)\nDestination: {destination}"
+            self, "File Transfer",
+            f"Sending {os.path.basename(path)} ({format_bytes(filesize)}) to {len(keys)} client(s)\n"
+            f"Destination: {destination}"
         )
 
 

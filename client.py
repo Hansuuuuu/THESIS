@@ -9,6 +9,8 @@ import json
 import mss
 import cv2
 import numpy as np
+import hashlib
+from collections import deque
 from datetime import datetime
 from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, 
                              QPushButton, QMessageBox, QTextEdit, QProgressBar,
@@ -29,8 +31,100 @@ STREAM_FPS = 10  # Frames per second for streaming
 # Constants (you can adjust)
 SCREENSHOT_QUALITY = 60      # JPEG quality
 SCREEN_SHARE_INTERVAL = 0.03  # seconds per frame (≈ 30 FPS)
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for resumable transfers
+RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache_client")
+os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
 
-
+# ================================================================================================
+class ResumableFileReceiver:
+    """Handles resumable file reception with checksums"""
+    
+    def __init__(self, transfer_id, filename, destination, filesize, total_chunks):
+        self.transfer_id = transfer_id
+        self.filename = filename
+        self.destination = destination
+        self.filesize = filesize
+        self.total_chunks = total_chunks
+        
+        # Metadata file for tracking progress
+        self.metadata_file = os.path.join(
+            RESUME_METADATA_DIR,
+            f"{transfer_id}.json"
+        )
+        
+        # Load or initialize progress
+        self.received_chunks = {}  # {chunk_index: checksum}
+        self.temp_file = None
+        self._load_progress()
+    
+    def _calculate_chunk_checksum(self, data):
+        """Calculate SHA256 checksum for chunk"""
+        return hashlib.sha256(data).hexdigest()
+    
+    def _load_progress(self):
+        """Load transfer progress from metadata file"""
+        try:
+            if os.path.exists(self.metadata_file):
+                with open(self.metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                    self.received_chunks = {int(k): v for k, v in metadata.get('received_chunks', {}).items()}
+                    self.temp_file = metadata.get('temp_file')
+        except Exception as e:
+            print(f"⚠️ Could not load progress: {e}")
+            self.received_chunks = {}
+    
+    def _save_progress(self):
+        """Save transfer progress to metadata file"""
+        try:
+            metadata = {
+                'transfer_id': self.transfer_id,
+                'filename': self.filename,
+                'destination': self.destination,
+                'filesize': self.filesize,
+                'total_chunks': self.total_chunks,
+                'received_chunks': {str(k): v for k, v in self.received_chunks.items()},
+                'temp_file': self.temp_file,
+                'last_update': time.time()
+            }
+            with open(self.metadata_file, 'w') as f:
+                json.dump(metadata, f)
+        except Exception as e:
+            print(f"⚠️ Could not save progress: {e}")
+    
+    def is_chunk_received(self, chunk_index):
+        """Check if a chunk has been received"""
+        return chunk_index in self.received_chunks
+    
+    def save_chunk(self, chunk_index, data, checksum):
+        """Save a chunk and verify checksum"""
+        # Verify checksum
+        actual_checksum = self._calculate_chunk_checksum(data)
+        if actual_checksum != checksum:
+            raise Exception(f"Checksum mismatch for chunk {chunk_index}")
+        
+        # Save chunk data
+        self.received_chunks[chunk_index] = checksum
+        self._save_progress()
+        
+        return True
+    
+    def get_progress(self):
+        """Get transfer progress percentage"""
+        return (len(self.received_chunks) / self.total_chunks) * 100 if self.total_chunks > 0 else 0
+    
+    def is_complete(self):
+        """Check if transfer is complete"""
+        return len(self.received_chunks) == self.total_chunks
+    
+    def cleanup(self):
+        """Remove metadata file after successful transfer"""
+        try:
+            if os.path.exists(self.metadata_file):
+                os.remove(self.metadata_file)
+        except:
+            pass
+        
+        
 class PresentationOverlay(QWidget):
     """Fullscreen overlay that displays admin's presentation"""
     
@@ -325,6 +419,7 @@ class StudentClient(QWidget):
         self.presentation_signals = LockSignals()
         self.presentation_signals.lock_requested.connect(self._show_presentation)
         self.presentation_signals.unlock_requested.connect(self._hide_presentation)
+        
     def setup_ui(self):
         """Setup the user interface"""
         main_layout = QVBoxLayout()
@@ -397,7 +492,313 @@ class StudentClient(QWidget):
         
         self.setLayout(main_layout)
         
+# ===============================================================================================================================
+    def listen_for_commands(self):
+        """Listen for commands and files from server"""
+        buffer = b""
+        consecutive_errors = 0
+        max_consecutive_errors = 3
         
+        while self.connected and self.running:
+            try:
+                # Set a reasonable timeout
+                self.client_socket.settimeout(1.0)
+                
+                try:
+                    data = self.client_socket.recv(BUFFER_SIZE)
+                except socket.timeout:
+                    # Timeout is normal, just continue
+                    consecutive_errors = 0
+                    continue
+                
+                if not data:
+                    self.log("Server closed connection")
+                    break
+                
+                # Reset error counter on successful receive
+                consecutive_errors = 0
+                buffer += data
+                
+                while b'\n' in buffer:
+                    line, buffer = buffer.split(b'\n', 1)
+                    command = line.decode('utf-8', errors='ignore').strip()
+                    
+                    if not command:
+                        continue
+                    
+                    try:
+                        # ✅ FILTER OUT TRANSFER PROTOCOL SIGNALS - Don't process as commands
+                        if command.upper() in [
+                            "TRANSFER_COMPLETE", 
+                            "VERIFIED", 
+                            "CHUNK_OK", 
+                            "CHUNK_ERROR", 
+                            "READY",
+                            "ERROR"
+                        ]:
+                            # These are handled by transfer methods, skip here
+                            self.log(f"Ignoring transfer signal: {command}")
+                            continue
+                        
+                        # ✅ Handle special commands that need buffer access
+                        elif command.upper() == "PRESENT_FRAME":
+                            self.log("Received presentation frame")
+                            buffer = self._handle_presentation_frame(buffer)
+                            continue
+                        
+                        elif command.upper() == "RESUMABLE_FILE":
+                            self.log("Received resumable file transfer request")
+                            try:
+                                buffer = self._handle_resumable_transfer(buffer)
+                            except Exception as e:
+                                self.log(f"Error in resumable transfer: {e}")
+                                import traceback
+                                self.log(f"Traceback: {traceback.format_exc()}")
+                            continue
+                        
+                        elif command.upper() == "SEND_FILE":
+                            self.log("Received standard file transfer")
+                            try:
+                                buffer = self._receive_file_from_socket(buffer)
+                            except Exception as e:
+                                self.log(f"Error in file transfer: {e}")
+                                import traceback
+                                self.log(f"Traceback: {traceback.format_exc()}")
+                            continue
+                        
+                        # Regular commands - process in separate thread
+                        else:
+                            self.log(f"Received command: {command}")
+                            threading.Thread(
+                                target=self.process_command,
+                                args=(command,),
+                                daemon=True
+                            ).start()
+                    
+                    except Exception as cmd_error:
+                        self.log(f"Error processing command '{command}': {cmd_error}")
+                        continue
+                        
+            except ConnectionResetError:
+                self.log("Connection reset by server")
+                break
+            except ConnectionAbortedError:
+                self.log("Connection aborted by server")
+                break
+            except OSError as e:
+                if hasattr(e, 'winerror'):
+                    if e.winerror in [10053, 10054]:  # Connection aborted/reset
+                        self.log(f"Connection closed by remote host")
+                        break
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    self.log(f"Too many socket errors: {e}")
+                    break
+                time.sleep(0.1)
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    self.log(f"Listen error: {e}")
+                    import traceback
+                    self.log(f"Traceback: {traceback.format_exc()}")
+                    break
+                time.sleep(0.1)
+        
+        # Connection lost - cleanup
+        self.disconnect_socket()
+        self.signals.update_status.emit("❌ Disconnected from server", "red")
+        self.reconnect_button.setEnabled(True)
+        
+        # Schedule reconnection
+        if self.running:
+            self.log(f"Reconnecting in {RECONNECT_DELAY//1000} seconds...")
+            QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
+
+
+    def _handle_presentation_frame(self, buffer):
+        """Handle presentation frame reception"""
+        try:
+            # Read 8-byte size
+            while len(buffer) < 8:
+                chunk = self.client_socket.recv(BUFFER_SIZE)
+                if not chunk:
+                    return buffer
+                buffer += chunk
+            
+            size = struct.unpack(">Q", buffer[:8])[0]
+            buffer = buffer[8:]
+            
+            # Read frame data
+            while len(buffer) < size:
+                needed = size - len(buffer)
+                chunk = self.client_socket.recv(min(BUFFER_SIZE, needed))
+                if not chunk:
+                    return buffer
+                buffer += chunk
+            
+            if len(buffer) >= size:
+                frame_data = buffer[:size]
+                buffer = buffer[size:]
+                
+                # Update presentation display
+                self.update_presentation_frame(frame_data)
+        
+        except Exception as e:
+            self.log(f"Error handling presentation frame: {e}")
+        
+        return buffer
+
+
+    def _handle_resumable_transfer(self, buffer):
+        """Handle resumable file transfer - FIXED VERSION"""
+        try:
+            # Read header length
+            while len(buffer) < 4:
+                buffer += self.client_socket.recv(BUFFER_SIZE)
+            
+            header_len = struct.unpack(">I", buffer[:4])[0]
+            buffer = buffer[4:]
+            
+            # Read header JSON
+            while len(buffer) < header_len:
+                buffer += self.client_socket.recv(BUFFER_SIZE)
+            
+            metadata = json.loads(buffer[:header_len].decode('utf-8'))
+            buffer = buffer[header_len:]
+            
+            # Extract metadata
+            transfer_id = metadata['transfer_id']
+            filename = metadata['filename']
+            destination = metadata['destination']
+            filesize = metadata['filesize']
+            total_chunks = metadata['total_chunks']
+            
+            self.log(f"📥 Receiving: {filename} ({filesize//1024//1024} MB)")
+            self.signals.file_progress.emit(0, f"Starting: {filename}")
+            
+            # Initialize receiver
+            receiver = ResumableFileReceiver(transfer_id, filename, destination, filesize, total_chunks)
+            
+            if receiver.received_chunks:
+                self.log(f"Resume: {len(receiver.received_chunks)}/{total_chunks} chunks exist")
+            
+            # Resolve destination
+            filepath = self._resolve_destination_path(destination, filename)
+            if not filepath:
+                self.client_socket.sendall(b"ERROR\n")
+                return buffer
+            
+            os.makedirs(os.path.dirname(filepath), exist_ok=True)
+            
+            # Send READY
+            self.client_socket.sendall(b"READY\n")
+            self.log("Sent READY")
+            
+            # Set timeout for chunks
+            self.client_socket.settimeout(30.0)
+            
+            chunk_data_map = {}
+            last_update = time.time()
+            
+            try:
+                while len(receiver.received_chunks) < total_chunks:
+                    # ✅ Check for completion signal and CONSUME it completely
+                    if b"TRANSFER_COMPLETE\n" in buffer:
+                        idx = buffer.find(b"TRANSFER_COMPLETE\n")
+                        buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
+                        self.log("✅ Received TRANSFER_COMPLETE signal (continuing connection)")
+                        break
+                    
+                    # Read chunk header (72 bytes)
+                    while len(buffer) < 72 and b"TRANSFER_COMPLETE\n" not in buffer:
+                        chunk = self.client_socket.recv(BUFFER_SIZE)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                    
+                    # Check again after receiving data
+                    if b"TRANSFER_COMPLETE\n" in buffer:
+                        idx = buffer.find(b"TRANSFER_COMPLETE\n")
+                        buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
+                        self.log("✅ Received TRANSFER_COMPLETE signal (continuing connection)")
+                        break
+                    
+                    if len(buffer) < 72:
+                        break
+                    
+                    # Parse header
+                    chunk_index, chunk_size = struct.unpack(">II", buffer[:8])
+                    checksum = buffer[8:72].rstrip(b'\x00').decode('utf-8')
+                    buffer = buffer[72:]
+                    
+                    # Read chunk data
+                    while len(buffer) < chunk_size:
+                        buffer += self.client_socket.recv(min(BUFFER_SIZE, chunk_size - len(buffer)))
+                    
+                    chunk_data = buffer[:chunk_size]
+                    buffer = buffer[chunk_size:]
+                    
+                    # Skip if already received
+                    if receiver.is_chunk_received(chunk_index):
+                        self.client_socket.sendall(b"CHUNK_OK\n")
+                        continue
+                    
+                    # Verify and save
+                    try:
+                        receiver.save_chunk(chunk_index, chunk_data, checksum)
+                        chunk_data_map[chunk_index] = chunk_data
+                        self.client_socket.sendall(b"CHUNK_OK\n")
+                        
+                        # Update progress
+                        if time.time() - last_update >= 1.0:
+                            progress = receiver.get_progress()
+                            self.signals.file_progress.emit(int(progress), f"{filename}: {progress:.0f}%")
+                            last_update = time.time()
+                    
+                    except Exception as e:
+                        self.log(f"Chunk {chunk_index} error: {e}")
+                        self.client_socket.sendall(b"CHUNK_ERROR\n")
+                        break
+            
+            finally:
+                self.client_socket.settimeout(None)
+            
+            # Check completion
+            if receiver.is_complete():
+                self.log(f"Writing {total_chunks} chunks to disk...")
+                
+                with open(filepath, 'wb') as f:
+                    for i in range(total_chunks):
+                        if i in chunk_data_map:
+                            f.write(chunk_data_map[i])
+                
+                # Send VERIFIED
+                try:
+                    self.client_socket.sendall(b"VERIFIED\n")
+                    self.log("Sent VERIFIED (staying connected)")
+                except:
+                    pass
+                
+                receiver.cleanup()
+                
+                self.signals.file_progress.emit(100, f"Complete: {filename}")
+                self.log(f"✅ Saved: {filepath}")
+                
+                self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
+                QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
+            
+            else:
+                progress = receiver.get_progress()
+                self.log(f"⚠️ Incomplete: {progress:.0f}%")
+                self.signals.file_progress.emit(int(progress), f"Paused: {progress:.0f}%")
+        
+        except Exception as e:
+            self.log(f"❌ Transfer error: {e}")
+            import traceback
+            self.log(f"Traceback: {traceback.format_exc()}")
+            self.signals.file_progress.emit(0, f"Error: {str(e)}")
+        
+        return buffer  # ✅ ALWAYS return buffer to continue listening
  # -----------------------------------------------------------------------------------------------------------------------------       
         # 3. Add these methods to StudentClient class:
     def _show_presentation(self, _):
@@ -428,9 +829,20 @@ class StudentClient(QWidget):
     def setup_system_tray(self):
         """Setup system tray icon"""
         try:
+            from PyQt5.QtGui import QIcon, QPixmap, QPainter
+            from PyQt5.QtCore import Qt
+            
+            # Create a simple icon if none exists
+            pixmap = QPixmap(32, 32)
+            pixmap.fill(Qt.transparent)
+            painter = QPainter(pixmap)
+            painter.setBrush(Qt.blue)
+            painter.drawEllipse(4, 4, 24, 24)
+            painter.end()
+            
             self.tray_icon = QSystemTrayIcon(self)
-            # You can set an icon here if you have one
-            # self.tray_icon.setIcon(QIcon("icon.png"))
+            self.tray_icon.setIcon(QIcon(pixmap))
+            self.tray_icon.setToolTip("Student Client")
             
             tray_menu = QMenu()
             show_action = QAction("Show Window", self)
@@ -459,7 +871,13 @@ class StudentClient(QWidget):
         self.signals.log_message.emit(f"[{timestamp}] {message}")
 
     def append_log(self, message):
-        """Append to log (thread-safe)"""
+        """Append to log (thread-safe) - also handles reconnection trigger"""
+        if message == "__RECONNECT_TRIGGER__":
+            # Special signal to trigger reconnection on GUI thread
+            QTimer.singleShot(0, self.attempt_connection)
+            return
+        
+        # Regular log message
         self.log_text.append(message)
         # Auto-scroll to bottom
         scrollbar = self.log_text.verticalScrollBar()
@@ -534,9 +952,24 @@ class StudentClient(QWidget):
     def start_heartbeat(self):
         """Start sending heartbeat to keep connection alive"""
         self.stop_heartbeat()
-        self.heartbeat_timer = QTimer()
+        
+        # ✅ FIXED: Always create timer on GUI thread using signal
+        self.signals.log_message.emit("__CREATE_HEARTBEAT__")
+
+    def _create_heartbeat_timer(self):
+        """Create heartbeat timer (called on GUI thread)"""
+        self.heartbeat_timer = QTimer(self)
         self.heartbeat_timer.timeout.connect(self.send_heartbeat)
-        self.heartbeat_timer.start(10000)  # Every 10 seconds
+        self.heartbeat_timer.start(10000)
+        def stop_heartbeat(self):
+            """Stop heartbeat timer"""
+            if self.heartbeat_timer:
+                try:
+                    self.heartbeat_timer.stop()
+                    self.heartbeat_timer.deleteLater()
+                except:
+                    pass
+                self.heartbeat_timer = None
 
     def stop_heartbeat(self):
         """Stop heartbeat timer"""
@@ -605,18 +1038,19 @@ class StudentClient(QWidget):
 
     def process_command(self, command):
         """Process received command"""
-        print(f"[DEBUG] Received command: '{command}'")
+        # Skip transfer protocol signals
+        if command.upper() in ["TRANSFER_COMPLETE", "VERIFIED", "CHUNK_OK", "CHUNK_ERROR", "READY"]:
+            return
+        
+        print(f"[DEBUG] Processing command: '{command}'")
         
         if command == "LOCK":
-            print("[DEBUG] Lock command received")
             self.lock_screen()
         elif command == "UNLOCK":
             self.unlock_screen()
         elif command == "START_PRESENTATION":
-            print("[DEBUG] Start presentation command received")
             self.presentation_signals.lock_requested.emit("")
         elif command == "STOP_PRESENTATION":
-            print("[DEBUG] Stop presentation command received")
             self.presentation_signals.unlock_requested.emit()
         elif command == "REQUEST_SCREEN":
             threading.Thread(target=self.send_screen_once, daemon=True).start()
@@ -627,9 +1061,6 @@ class StudentClient(QWidget):
         elif command.startswith("MESSAGE:"):
             msg = command[8:]
             self.signals.show_message.emit("Message from Admin", msg)
-        elif command.startswith("SEND_FILE:"):
-            filename = command.split(":", 1)[1]
-            threading.Thread(target=self.receive_file, args=(filename,), daemon=True).start()
             
     def _create_lock_overlay(self, logo_path):
         """Create lock overlay on main thread"""
@@ -780,18 +1211,31 @@ class StudentClient(QWidget):
             self.log(f"File receive error: {e}")
             self.signals.file_progress.emit(0, f"Error: {str(e)}")
             
+    
     def listen_for_commands(self):
         """Listen for commands and files from server"""
-        self.client_socket.settimeout(1.0)
         buffer = b""
+        consecutive_errors = 0
+        max_consecutive_errors = 3
         
         while self.connected and self.running:
             try:
-                data = self.client_socket.recv(BUFFER_SIZE)
+                # Set a reasonable timeout
+                self.client_socket.settimeout(1.0)
+                
+                try:
+                    data = self.client_socket.recv(BUFFER_SIZE)
+                except socket.timeout:
+                    # Timeout is normal, just continue
+                    consecutive_errors = 0
+                    continue
+                
                 if not data:
                     self.log("Server closed connection")
                     break
                 
+                # Reset error counter on successful receive
+                consecutive_errors = 0
                 buffer += data
                 
                 while b'\n' in buffer:
@@ -801,62 +1245,99 @@ class StudentClient(QWidget):
                     if not command:
                         continue
                     
-                    self.log(f"Received command: {command}")
-                    
-                    # Handle presentation frames
-                    if command.upper() == "PRESENT_FRAME":
-                        # Read 8-byte size
-                        while len(buffer) < 8:
-                            chunk = self.client_socket.recv(BUFFER_SIZE)
-                            if not chunk:
-                                break
-                            buffer += chunk
-                        
-                        if len(buffer) < 8:
+                    try:
+                        # ✅ FILTER OUT TRANSFER PROTOCOL SIGNALS
+                        if command.upper() in [
+                            "TRANSFER_COMPLETE", 
+                            "VERIFIED", 
+                            "CHUNK_OK", 
+                            "CHUNK_ERROR", 
+                            "READY",
+                            "ERROR"
+                        ]:
+                            # These are handled by transfer methods, skip here
                             continue
                         
-                        size = struct.unpack(">Q", buffer[:8])[0]
-                        buffer = buffer[8:]
+                        # Handle special commands that need buffer access
+                        elif command.upper() == "PRESENT_FRAME":
+                            buffer = self._handle_presentation_frame(buffer)
+                            continue
                         
-                        # Read frame data
-                        while len(buffer) < size:
-                            needed = size - len(buffer)
-                            chunk = self.client_socket.recv(min(BUFFER_SIZE, needed))
-                            if not chunk:
-                                break
-                            buffer += chunk
+                        elif command.upper() == "RESUMABLE_FILE":
+                            try:
+                                buffer = self._handle_resumable_transfer(buffer)
+                            except Exception as e:
+                                self.log(f"Error in resumable transfer: {e}")
+                            continue
                         
-                        if len(buffer) >= size:
-                            frame_data = buffer[:size]
-                            buffer = buffer[size:]
-                            
-                            # Update presentation display
-                            self.update_presentation_frame(frame_data)
+                        elif command.upper() == "SEND_FILE":
+                            try:
+                                buffer = self._receive_file_from_socket(buffer)
+                            except Exception as e:
+                                self.log(f"Error in file transfer: {e}")
+                            continue
+                        
+                        # Regular commands - process in separate thread
+                        else:
+                            self.log(f"Received command: {command}")
+                            threading.Thread(
+                                target=self.process_command,
+                                args=(command,),
+                                daemon=True
+                            ).start()
                     
-                    elif command.upper() == "SEND_FILE":
-                        self._receive_file_from_socket(buffer)
-                        buffer = b""
-                    else:
-                        threading.Thread(
-                            target=self.process_command,
-                            args=(command,),
-                            daemon=True
-                        ).start()
-                    
-            except socket.timeout:
-                continue
-            except Exception as e:
-                self.log(f"Listen error: {e}")
+                    except Exception as cmd_error:
+                        self.log(f"Error processing command '{command}': {cmd_error}")
+                        continue
+                        
+            except ConnectionResetError:
+                self.log("Connection reset by server")
                 break
+            except ConnectionAbortedError:
+                self.log("Connection aborted by server")
+                break
+            except OSError as e:
+                if hasattr(e, 'winerror'):
+                    if e.winerror in [10053, 10054]:
+                        self.log(f"Connection closed by remote host")
+                        break
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    self.log(f"Too many socket errors: {e}")
+                    break
+                time.sleep(0.1)
+            except Exception as e:
+                consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    self.log(f"Listen error: {e}")
+                    break
+                time.sleep(0.1)
         
-        # Connection lost
+        # Connection lost - cleanup
         self.disconnect_socket()
         self.signals.update_status.emit("❌ Disconnected from server", "red")
         self.reconnect_button.setEnabled(True)
         
+        # ✅ FIXED: Simple thread-safe reconnection
         if self.running:
             self.log(f"Reconnecting in {RECONNECT_DELAY//1000} seconds...")
-            QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
+            # Use threading.Timer instead of QTimer from non-GUI thread
+            reconnect_timer = threading.Timer(
+                RECONNECT_DELAY / 1000.0,
+                self._trigger_reconnect_from_thread
+            )
+            reconnect_timer.daemon = True
+            reconnect_timer.start()
+
+    # Add this new method:
+    def _trigger_reconnect_from_thread(self):
+        """Trigger reconnection from worker thread (thread-safe)"""
+        try:
+            # Use signal to safely communicate with GUI thread
+            self.signals.log_message.emit("__RECONNECT_TRIGGER__")
+        except:
+            pass
+
 
 
     def _receive_file_from_socket(self, initial_buffer):
@@ -869,7 +1350,7 @@ class StudentClient(QWidget):
                 chunk = self.client_socket.recv(BUFFER_SIZE)
                 if not chunk:
                     self.log("Error: Connection closed while reading metadata length")
-                    return
+                    return b""
                 buffer += chunk
             
             meta_len = struct.unpack(">I", buffer[:4])[0]
@@ -880,7 +1361,7 @@ class StudentClient(QWidget):
                 chunk = self.client_socket.recv(BUFFER_SIZE)
                 if not chunk:
                     self.log("Error: Connection closed while reading metadata")
-                    return
+                    return b""
                 buffer += chunk
             
             meta_json = buffer[:meta_len]
@@ -905,7 +1386,7 @@ class StudentClient(QWidget):
             if not filepath:
                 self.log(f"Error: Invalid destination path: {destination}")
                 self.signals.file_progress.emit(0, "Error: Invalid destination")
-                return
+                return b""
             
             # Ensure directory exists
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
@@ -949,11 +1430,14 @@ class StudentClient(QWidget):
             # Hide progress after 3 seconds
             QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
             
+            return buffer  # Return remaining buffer
+            
         except Exception as e:
             self.log(f"File receive error: {e}")
             import traceback
             self.log(f"Traceback: {traceback.format_exc()}")
             self.signals.file_progress.emit(0, f"Error: {str(e)}")
+            return b""
 
 
     def _resolve_destination_path(self, destination, filename):
