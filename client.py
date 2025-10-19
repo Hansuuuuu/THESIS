@@ -20,7 +20,7 @@ from PIL import ImageGrab
 # ==============================
 # Configuration
 # ==============================
-SERVER_HOST = '192.168.68.103'  # Change this to admin/teacher IP
+SERVER_HOST = '192.168.68.110'  # Change this to admin/teacher IP
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000  # milliseconds
@@ -34,61 +34,122 @@ SCREEN_SHARE_INTERVAL = 0.03  # seconds per frame (≈ 30 FPS)
 
 class LockOverlay(QWidget):
     """Full-screen overlay that blocks all input and shows a lock message"""
-    def __init__(self, message="🔒 Locked by Administrator", logo_path=None):
+    
+    def __init__(self, message="🔒 Locked by Administrator", logo_path=None, parent=None):
         super().__init__()
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.X11BypassWindowManagerHint)
-        self.setWindowModality(Qt.ApplicationModal)
-        self.setWindowTitle("Locked")
-
+        self.parent_window = parent
+        self.unlocked = False
+        
+        # Use borderless window without modal
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
+        self.setAttribute(Qt.WA_TranslucentBackground, False)
+        self.setFocusPolicy(Qt.StrongFocus)
+        
         # Make background black
-        palette = QPalette()
-        palette.setColor(QPalette.Window, QColor(0, 0, 0))
-        self.setPalette(palette)
-        self.setAutoFillBackground(True)
-
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #000000;
+            }
+        """)
+        
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignCenter)
-
+        layout.setSpacing(30)
+        layout.setContentsMargins(50, 50, 50, 50)
+        
         # Optional logo
+        logo_loaded = False
         if logo_path:
-            logo = QLabel()
-            pix = QPixmap(logo_path)
-            logo.setPixmap(pix.scaledToHeight(200, Qt.SmoothTransformation))
-            logo.setAlignment(Qt.AlignCenter)
-            layout.addWidget(logo)
-
-        # Message label
+            print(f"[DEBUG] Looking for logo at: {logo_path}")
+            print(f"[DEBUG] File exists: {os.path.exists(logo_path)}")
+            
+            if os.path.exists(logo_path):
+                try:
+                    logo = QLabel()
+                    pix = QPixmap(logo_path)
+                    print(f"[DEBUG] Pixmap isNull: {pix.isNull()}")
+                    print(f"[DEBUG] Pixmap size: {pix.width()} x {pix.height()}")
+                    
+                    if not pix.isNull():
+                        scaled_pix = pix.scaledToHeight(150, Qt.SmoothTransformation)
+                        logo.setPixmap(scaled_pix)
+                        logo.setAlignment(Qt.AlignCenter)
+                        layout.addWidget(logo)
+                        logo_loaded = True
+                        print(f"[DEBUG] Logo loaded successfully")
+                except Exception as e:
+                    print(f"[ERROR] Error loading logo: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print(f"[ERROR] Logo file not found at: {logo_path}")
+        
+        if not logo_loaded:
+            error_label = QLabel("(No logo found)")
+            error_label.setStyleSheet("color: #ffcc00; font-size: 12px;")
+            error_label.setAlignment(Qt.AlignCenter)
+            layout.addWidget(error_label)
+        
+        # Main message label
         label = QLabel(message)
-        label.setStyleSheet("color: white; font-size: 28px; font-weight: bold;")
+        label.setStyleSheet("color: white; font-size: 36px; font-weight: bold; margin: 20px;")
         label.setAlignment(Qt.AlignCenter)
         layout.addWidget(label)
-
-        self.setLayout(layout)
-
-        # Prevent keyboard/mouse interaction
-        self.grabKeyboard()
-        self.grabMouse()
         
+        # Unlock instruction
+        instruction = QLabel("Press 'U' key to unlock")
+        instruction.setStyleSheet("color: #cccccc; font-size: 16px;")
+        instruction.setAlignment(Qt.AlignCenter)
+        layout.addWidget(instruction)
+        
+        layout.addStretch()
+        self.setLayout(layout)
+    
+    def showFullScreen(self):
+        """Show the overlay in fullscreen"""
+        super().showFullScreen()
+        self.setFocus()
+        self.raise_()
+        self.activateWindow()
+        print(f"[DEBUG] Overlay shown fullscreen")
+    
     def keyPressEvent(self, event):
+        """Handle key press - only respond to 'U' key for unlock"""
+        if event.isAutoRepeat():
+            return
+        
         if event.key() == Qt.Key_U:
-                code, ok = QInputDialog.getText(self, "Unlock", "Enter admin code:")
-        if ok and code == "admin123":  # Replace with your admin code
-            self.close()
+            code, ok = QInputDialog.getText(
+                self, 
+                "Unlock Screen", 
+                "Enter unlock code:",
+                text=""
+            )
+            if ok and code == "admin123":
+                print(f"[DEBUG] Correct unlock code entered")
+                self.unlocked = True
+                self.close()
+            elif ok:
+                print(f"[DEBUG] Incorrect unlock code entered")
+                QMessageBox.warning(self, "Incorrect", "Incorrect unlock code")
         else:
-            pass
-
-    def keyPressEvent(self, event):
-        pass  # ignore all keys
-
+            event.ignore()
+    
     def mousePressEvent(self, event):
-        pass  # ignore clicks
-
+        """Ignore mouse clicks"""
+        pass
+    
     def closeEvent(self, event):
-        # Release locks when closed
-        self.releaseKeyboard()
-        self.releaseMouse()
+        """Handle window close"""
+        print(f"[DEBUG] LockOverlay closeEvent triggered")
+        # DO NOT set parent_window.overlay = None here
+        # Let the parent handle it
         event.accept()
-
+        
+class LockSignals(QObject):
+    """Signal emitter for thread-safe lock screen operations"""
+    lock_requested = pyqtSignal(str)  # logo_path
+    unlock_requested = pyqtSignal()
 
 # ==============================
 # Signal Handler for Thread-Safe GUI Updates
@@ -161,6 +222,18 @@ class StudentClient(QWidget):
         self.signals.show_message.connect(self.display_message)
         self.signals.file_progress.connect(self.update_file_progress)
         self.signals.log_message.connect(self.append_log)
+        
+        # Signal handler for thread-safe updates
+        self.signals = SignalHandler()
+        self.signals.update_status.connect(self.update_status_label)
+        self.signals.show_message.connect(self.display_message)
+        self.signals.file_progress.connect(self.update_file_progress)
+        self.signals.log_message.connect(self.append_log)
+        
+        # ADD THIS: Lock screen signals
+        self.lock_signals = LockSignals()
+        self.lock_signals.lock_requested.connect(self._create_lock_overlay)
+        self.lock_signals.unlock_requested.connect(self.unlock_screen)
         
         self.setup_ui()
         self.setup_system_tray()
@@ -439,29 +512,74 @@ class StudentClient(QWidget):
         elif command.startswith("SEND_FILE:"):
             filename = command.split(":", 1)[1]
             threading.Thread(target=self.receive_file, args=(filename,), daemon=True).start()
+            
+    def _create_lock_overlay(self, logo_path):
+        """Create lock overlay on main thread"""
+        print(f"[DEBUG] _create_lock_overlay() called")
+        
+        if getattr(self, "overlay", None) is not None:
+            print(f"[DEBUG] Overlay already exists, ignoring lock request")
+            return  # already locked
+        
+        print(f"[DEBUG] Creating new overlay on main thread")
+        self.overlay = LockOverlay(
+            "🔒 Locked by Administrator",
+            logo_path=logo_path,
+            parent=self
+        )
+        self.overlay.showFullScreen()
+        print(f"[DEBUG] Overlay reference stored in self.overlay")
+
 
     def lock_screen(self):
         """Lock the student's screen"""
         if getattr(self, "overlay", None) is not None:
-            return  # already locked
+            return
 
         self.log("Screen locked by administrator")
         self.signals.update_status.emit("🔒 Screen is LOCKED by Admin", "red")
 
-        self.overlay = LockOverlay("🔒 Locked by Administrator", logo_path="school_logo.png")
-        self.overlay.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
-        self.overlay.showFullScreen()
+        # Get the full path to school_logo.png
+        if getattr(sys, 'frozen', False):
+            # Running as compiled executable
+            script_dir = sys._MEIPASS
+        else:
+            # Running as script
+            script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        logo_path = os.path.join(script_dir, "school_logo.png")
+        
+        print(f"[DEBUG] Script directory: {script_dir}")
+        print(f"[DEBUG] Logo path: {logo_path}")
+        print(f"[DEBUG] File exists: {os.path.exists(logo_path)}")
+        
+        # Emit signal to create overlay on main thread (thread-safe)
+        self.lock_signals.lock_requested.emit(logo_path)
+
+
 
     def unlock_screen(self):
         """Unlock the student's screen"""
+        print(f"[DEBUG] unlock_screen() called")
+        print(f"[DEBUG] overlay exists: {getattr(self, 'overlay', None) is not None}")
+        
         if getattr(self, "overlay", None):
-            self.overlay.close()
-            self.overlay = None
-
+            print(f"[DEBUG] Closing overlay")
+            try:
+                self.overlay.close()
+            except Exception as e:
+                print(f"[DEBUG] Error closing overlay: {e}")
+            finally:
+                self.overlay = None
+                print(f"[DEBUG] Overlay reference cleared")
+        else:
+            print(f"[DEBUG] No overlay to close")
+        
+        # Update status - always emit this
         self.signals.update_status.emit("✅ Screen unlocked", "green")
         self.log("Screen unlocked by administrator")
-        
-
+        print(f"[DEBUG] Status updated to green")
+    
     def display_message(self, title, message):
         """Display message box (thread-safe)"""
         QMessageBox.information(self, title, message)
