@@ -1,6 +1,6 @@
 """
-Lab Manager - Student Client - COMPLETE VERSION
-All features working: Lock/Unlock, File Reception, Screen Sharing, Presentation Viewing, Auto-Reconnect
+Lab Manager - Student Client - FIXED AUTO-RECONNECT
+Continuously reconnects every 5 seconds until connected
 """
 
 import sys
@@ -38,7 +38,7 @@ from PyQt5.QtCore import QByteArray
 SERVER_HOST = '192.168.68.103'  # Change to admin IP if on different computer
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
-RECONNECT_DELAY = 5000
+RECONNECT_DELAY = 5000  # 5 seconds
 SCREENSHOT_QUALITY = 60
 CHUNK_SIZE = 4 * 1024 * 1024
 SOCKET_SEND_BUFFER = 16 * 1024 * 1024
@@ -201,30 +201,22 @@ class LockOverlay(QWidget):
         self.unlocked = False
         self.logo_pixmap = None
         
-        # Use borderless window without modal
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setFocusPolicy(Qt.StrongFocus)
         
-        # Make background black (fallback if no logo)
         self.setStyleSheet("""
             QWidget {
                 background-color: #000000;
             }
         """)
         
-        # Try to load logo
         if logo_path and os.path.exists(logo_path):
-            print(f"[DEBUG] Loading logo from: {logo_path}")
             try:
                 self.logo_pixmap = QPixmap(logo_path)
                 if self.logo_pixmap.isNull():
-                    print(f"[ERROR] Failed to load logo pixmap")
                     self.logo_pixmap = None
-                else:
-                    print(f"[DEBUG] Logo loaded successfully: {self.logo_pixmap.width()} x {self.logo_pixmap.height()}")
-            except Exception as e:
-                print(f"[ERROR] Error loading logo: {e}")
+            except:
                 self.logo_pixmap = None
         
         layout = QVBoxLayout()
@@ -232,7 +224,6 @@ class LockOverlay(QWidget):
         layout.setSpacing(30)
         layout.setContentsMargins(50, 50, 50, 50)
         
-        # Main message label with semi-transparent background for readability
         label = QLabel(message)
         label.setStyleSheet("""
             color: white; 
@@ -246,7 +237,6 @@ class LockOverlay(QWidget):
         label.setAlignment(Qt.AlignCenter)
         layout.addWidget(label)
         
-        # Unlock instruction
         instruction = QLabel("Press 'U' key to unlock")
         instruction.setStyleSheet("""
             color: #cccccc; 
@@ -262,28 +252,22 @@ class LockOverlay(QWidget):
         self.setLayout(layout)
     
     def paintEvent(self, event):
-        """Custom paint to draw the logo stretched to fill screen"""
         painter = QPainter(self)
         
         if self.logo_pixmap and not self.logo_pixmap.isNull():
-            # Draw logo stretched to fill entire widget
             painter.drawPixmap(self.rect(), self.logo_pixmap)
         else:
-            # Fallback to black background
             painter.fillRect(self.rect(), QColor(0, 0, 0))
         
         painter.end()
     
     def showFullScreen(self):
-        """Show the overlay in fullscreen"""
         super().showFullScreen()
         self.setFocus()
         self.raise_()
         self.activateWindow()
-        print(f"[DEBUG] Overlay shown fullscreen")
     
     def keyPressEvent(self, event):
-        """Handle key press - only respond to 'U' key for unlock"""
         if event.isAutoRepeat():
             return
         
@@ -295,22 +279,17 @@ class LockOverlay(QWidget):
                 text=""
             )
             if ok and code == "admin123":
-                print(f"[DEBUG] Correct unlock code entered")
                 self.unlocked = True
                 self.close()
             elif ok:
-                print(f"[DEBUG] Incorrect unlock code entered")
                 QMessageBox.warning(self, "Incorrect", "Incorrect unlock code")
         else:
             event.ignore()
     
     def mousePressEvent(self, event):
-        """Ignore mouse clicks"""
         pass
     
     def closeEvent(self, event):
-        """Handle window close"""
-        print(f"[DEBUG] LockOverlay closeEvent triggered")
         event.accept()
 
 
@@ -336,6 +315,10 @@ class StudentClient(QWidget):
             QPushButton:hover {
                 background-color: #4a4a4a;
             }
+            QPushButton:disabled {
+                background-color: #2a2a2a;
+                color: #666;
+            }
             QTextEdit {
                 background-color: #1e1e1e;
                 border: 1px solid #444;
@@ -360,6 +343,8 @@ class StudentClient(QWidget):
         self.reconnect_timer = None
         self.heartbeat_timer = None
         self.sharing_active = False
+        self.connecting = False
+        self.reconnect_scheduled = False  # NEW: Track if reconnect is scheduled
         
         self.signals = SignalHandler()
         self.signals.update_status.connect(self.update_status_label)
@@ -381,6 +366,7 @@ class StudentClient(QWidget):
         self.setup_system_tray()
         
         self.log("Application started")
+        self.log(f"Target server: {SERVER_HOST}:{SERVER_PORT}")
         QTimer.singleShot(500, self.attempt_connection)
     
     def setup_ui(self):
@@ -405,9 +391,9 @@ class StudentClient(QWidget):
         
         button_layout = QHBoxLayout()
         
-        self.reconnect_button = QPushButton("🔄 Reconnect")
+        self.reconnect_button = QPushButton("🔄 Reconnect Now")
         self.reconnect_button.clicked.connect(self.manual_reconnect)
-        self.reconnect_button.setEnabled(False)
+        self.reconnect_button.setEnabled(True)
         button_layout.addWidget(self.reconnect_button)
         
         self.share_screen_button = QPushButton("📷 Share Screen")
@@ -440,7 +426,7 @@ class StudentClient(QWidget):
         self.log_text.setMaximumHeight(200)
         main_layout.addWidget(self.log_text)
         
-        footer = QLabel("💡 Minimizes to system tray")
+        footer = QLabel("💡 Auto-reconnects every 5 seconds • Minimizes to system tray")
         footer.setAlignment(Qt.AlignCenter)
         footer.setStyleSheet("color: #666; font-size: 11px; padding: 10px;")
         main_layout.addWidget(footer)
@@ -504,9 +490,31 @@ class StudentClient(QWidget):
         else:
             self.status_label.setStyleSheet("background-color: #3c3c3c; padding: 15px; border-radius: 8px;")
     
-    def attempt_connection(self):
-        if self.connected or not self.running:
+    def schedule_reconnect(self):
+        """Schedule a reconnect attempt after RECONNECT_DELAY"""
+        if not self.running or self.connected or self.reconnect_scheduled:
             return
+        
+        self.reconnect_scheduled = True
+        self.log(f"Next reconnect attempt in {RECONNECT_DELAY//1000} seconds...")
+        QTimer.singleShot(RECONNECT_DELAY, self._do_scheduled_reconnect)
+    
+    def _do_scheduled_reconnect(self):
+        """Execute the scheduled reconnect"""
+        self.reconnect_scheduled = False
+        if not self.connected and self.running:
+            self.attempt_connection()
+    
+    def attempt_connection(self):
+        # Prevent multiple simultaneous connection attempts
+        if self.connecting or self.connected:
+            return
+        
+        if not self.running:
+            return
+        
+        self.connecting = True
+        self.reconnect_button.setEnabled(False)
         
         self.log("Attempting to connect to server...")
         self.signals.update_status.emit("🔄 Connecting to server...", "")
@@ -514,39 +522,70 @@ class StudentClient(QWidget):
         def connect_thread():
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(10)
+                sock.settimeout(5)  # 5 second timeout for connection attempt
+                
                 sock.connect((SERVER_HOST, SERVER_PORT))
                 sock.settimeout(None)
                 
+                # Success!
                 self.client_socket = sock
                 self.connected = True
+                self.connecting = False
                 
                 self.signals.update_status.emit("✅ Connected to Admin/Teacher Server", "green")
-                self.log("Successfully connected to server")
+                self.log("✅ Successfully connected to server")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(False))
                 
                 threading.Thread(target=self.listen_for_commands, daemon=True).start()
                 QTimer.singleShot(0, self.start_heartbeat)
             
-            except Exception as e:
+            except (socket.timeout, TimeoutError):
+                self.connecting = False
                 self.connected = False
-                self.signals.update_status.emit(f"❌ Connection failed", "red")
-                self.log(f"Connection failed: {e}")
+                self.signals.update_status.emit(f"❌ Connection timeout", "red")
+                self.log(f"Connection timeout - Server may be offline")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(True))
                 
-                if self.running:
-                    self.log(f"Retrying in {RECONNECT_DELAY//1000} seconds...")
-                    QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
+                # FIXED: Always schedule reconnect
+                QTimer.singleShot(0, self.schedule_reconnect)
+            
+            except ConnectionRefusedError:
+                self.connecting = False
+                self.connected = False
+                self.signals.update_status.emit(f"❌ Connection refused", "red")
+                self.log(f"Connection refused - Admin application not running")
+                QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(True))
+                
+                # FIXED: Always schedule reconnect
+                QTimer.singleShot(0, self.schedule_reconnect)
+            
+            except Exception as e:
+                self.connecting = False
+                self.connected = False
+                error_msg = str(e)
+                self.signals.update_status.emit(f"❌ Connection failed", "red")
+                self.log(f"Connection failed: {error_msg}")
+                QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(True))
+                
+                # FIXED: Always schedule reconnect
+                QTimer.singleShot(0, self.schedule_reconnect)
         
         threading.Thread(target=connect_thread, daemon=True).start()
     
     def manual_reconnect(self):
+        self.log("📍 Manual reconnect requested")
         self.reconnect_button.setEnabled(False)
+        
+        # Cancel any scheduled reconnect
+        self.reconnect_scheduled = False
+        
+        # Disconnect and reconnect immediately
         self.disconnect_socket()
         QTimer.singleShot(500, self.attempt_connection)
     
     def disconnect_socket(self):
         self.connected = False
+        self.connecting = False
         self.screen_sharing = False
         self.sharing_active = False
         self.stop_heartbeat()
@@ -561,7 +600,7 @@ class StudentClient(QWidget):
         self.stop_heartbeat()
         self.heartbeat_timer = QTimer(self)
         self.heartbeat_timer.timeout.connect(self.send_heartbeat)
-        self.heartbeat_timer.start(10000)
+        self.heartbeat_timer.start(10000)  # 10 seconds
     
     def stop_heartbeat(self):
         if self.heartbeat_timer:
@@ -577,10 +616,14 @@ class StudentClient(QWidget):
             try:
                 self.client_socket.sendall(b"HEARTBEAT\n")
             except:
+                self.log("💔 Heartbeat failed - connection lost")
                 self.disconnect_socket()
                 self.signals.update_status.emit("❌ Connection lost", "red")
+                self.reconnect_button.setEnabled(True)
+                
+                # Schedule reconnect after heartbeat failure
                 if self.running:
-                    QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
+                    self.schedule_reconnect()
     
     def listen_for_commands(self):
         buffer = b""
@@ -635,43 +678,34 @@ class StudentClient(QWidget):
                             ).start()
                     
                     except Exception as cmd_error:
-                        self.log(f"Error: {cmd_error}")
+                        self.log(f"Command error: {cmd_error}")
                         continue
             
             except (ConnectionResetError, ConnectionAbortedError):
-                self.log("Connection closed")
+                self.log("Connection closed by server")
                 break
             except OSError as e:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
-                    self.log(f"Too many errors")
+                    self.log(f"Too many consecutive errors")
                     break
                 time.sleep(0.1)
             except Exception as e:
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors:
-                    self.log(f"Listen error")
+                    self.log(f"Listen error - disconnecting")
                     break
                 time.sleep(0.1)
         
+        # Connection ended - cleanup and schedule reconnect
         self.disconnect_socket()
         self.signals.update_status.emit("❌ Disconnected", "red")
         self.reconnect_button.setEnabled(True)
         
+        # FIXED: Always schedule reconnect when disconnected
         if self.running:
-            self.log(f"Reconnecting in {RECONNECT_DELAY//1000}s...")
-            reconnect_timer = threading.Timer(
-                RECONNECT_DELAY / 1000.0,
-                self._trigger_reconnect_from_thread
-            )
-            reconnect_timer.daemon = True
-            reconnect_timer.start()
-    
-    def _trigger_reconnect_from_thread(self):
-        try:
-            self.signals.log_message.emit("__RECONNECT_TRIGGER__")
-        except:
-            pass
+            self.log("Connection lost - auto-reconnect scheduled")
+            QTimer.singleShot(0, self.schedule_reconnect)
     
     def process_command(self, command):
         if command.upper() in ["TRANSFER_COMPLETE", "VERIFIED", "CHUNK_OK", "CHUNK_ERROR", "READY"]:
@@ -694,12 +728,28 @@ class StudentClient(QWidget):
         elif command.startswith("MESSAGE:"):
             msg = command[8:]
             self.signals.show_message.emit("Message from Admin", msg)
+            
+        elif command.startswith("COLLECT_FILES:"):
+            source_path = command.split(":", 1)[1]
+            threading.Thread(
+                target=self.collect_and_send_files,
+                args=(source_path,),
+                daemon=True
+            ).start()
+    
+        elif command.startswith("SEND_FILE_TO_ADMIN:"):
+            file_path = command.split(":", 1)[1]
+            threading.Thread(
+                target=self.send_file_to_admin,
+                args=(file_path,),
+                daemon=True
+            ).start()
     
     def _create_lock_overlay(self, logo_path):
         if getattr(self, "overlay", None) is not None:
             return
         
-        self.log("Screen locked by admin")
+        self.log("🔒 Screen locked by admin")
         self.signals.update_status.emit("🔒 LOCKED", "red")
         
         if getattr(sys, 'frozen', False):
@@ -734,18 +784,18 @@ class StudentClient(QWidget):
                 self.overlay = None
         
         self.signals.update_status.emit("✅ Unlocked", "green")
-        self.log("Screen unlocked")
+        self.log("🔓 Screen unlocked")
     
     def _show_presentation(self, _):
         if self.presentation_overlay is None:
-            self.log("Presentation mode started")
+            self.log("📽️ Presentation mode started")
             self.presentation_overlay = PresentationOverlay(self)
             self.presentation_overlay.showFullScreen()
             self.signals.update_status.emit("📽️ Viewing Presentation", "yellow")
     
     def _hide_presentation(self):
         if self.presentation_overlay:
-            self.log("Presentation mode ended")
+            self.log("📽️ Presentation mode ended")
             self.presentation_overlay.close()
             self.presentation_overlay = None
             self.signals.update_status.emit("✅ Connected", "green")
@@ -1006,7 +1056,7 @@ class StudentClient(QWidget):
             return
         
         try:
-            self.log("Capturing screenshot...")
+            self.log("📸 Capturing screenshot...")
             screenshot = ImageGrab.grab()
             
             buffer = io.BytesIO()
@@ -1017,7 +1067,7 @@ class StudentClient(QWidget):
             size = struct.pack(">Q", len(data))
             
             self.client_socket.sendall(header + size + data)
-            self.log(f"Screenshot sent")
+            self.log(f"✅ Screenshot sent ({len(data)//1024} KB)")
         except Exception as e:
             self.log(f"Screenshot error: {e}")
     
@@ -1034,7 +1084,7 @@ class StudentClient(QWidget):
             return
         
         self.sharing_active = True
-        self.log("Screen sharing started")
+        self.log("📹 Screen sharing started")
         
         def share_loop():
             with mss.mss() as sct:
@@ -1064,19 +1114,19 @@ class StudentClient(QWidget):
     def stop_screen_share(self):
         if getattr(self, 'sharing_active', False):
             self.sharing_active = False
-            self.log("Screen sharing stopped")
+            self.log("🛑 Screen sharing stopped")
     
     def start_streaming_screen(self):
         if not self.screen_sharing:
             self.screen_sharing = True
-            self.log("Screen streaming started")
+            self.log("📹 Screen streaming started")
             self.signals.update_status.emit("📹 Streaming...", "yellow")
             threading.Thread(target=self.stream_screen, daemon=True).start()
     
     def stop_streaming_screen(self):
         if self.screen_sharing:
             self.screen_sharing = False
-            self.log("Screen streaming stopped")
+            self.log("🛑 Screen streaming stopped")
             self.signals.update_status.emit("✅ Connected", "green")
     
     def stream_screen(self):
@@ -1108,6 +1158,7 @@ class StudentClient(QWidget):
     
     def quit_application(self):
         self.running = False
+        self.reconnect_scheduled = False
         self.disconnect_socket()
         QApplication.quit()
     
