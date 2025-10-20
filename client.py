@@ -650,155 +650,107 @@ class StudentClient(QWidget):
 
 
     def _handle_resumable_transfer(self, buffer):
-        """Handle resumable file transfer - FIXED VERSION"""
-        try:
-            # Read header length
-            while len(buffer) < 4:
-                buffer += self.client_socket.recv(BUFFER_SIZE)
-            
-            header_len = struct.unpack(">I", buffer[:4])[0]
-            buffer = buffer[4:]
-            
-            # Read header JSON
-            while len(buffer) < header_len:
-                buffer += self.client_socket.recv(BUFFER_SIZE)
-            
-            metadata = json.loads(buffer[:header_len].decode('utf-8'))
-            buffer = buffer[header_len:]
-            
-            # Extract metadata
-            transfer_id = metadata['transfer_id']
-            filename = metadata['filename']
-            destination = metadata['destination']
-            filesize = metadata['filesize']
-            total_chunks = metadata['total_chunks']
-            
-            self.log(f"📥 Receiving: {filename} ({filesize//1024//1024} MB)")
-            self.signals.file_progress.emit(0, f"Starting: {filename}")
-            
-            # Initialize receiver
-            receiver = ResumableFileReceiver(transfer_id, filename, destination, filesize, total_chunks)
-            
-            if receiver.received_chunks:
-                self.log(f"Resume: {len(receiver.received_chunks)}/{total_chunks} chunks exist")
-            
-            # Resolve destination
-            filepath = self._resolve_destination_path(destination, filename)
-            if not filepath:
-                self.client_socket.sendall(b"ERROR\n")
-                return buffer
-            
-            os.makedirs(os.path.dirname(filepath), exist_ok=True)
-            
-            # Send READY
-            self.client_socket.sendall(b"READY\n")
-            self.log("Sent READY")
-            
-            # Set timeout for chunks
-            self.client_socket.settimeout(30.0)
-            
-            chunk_data_map = {}
-            last_update = time.time()
-            
+            """Handle resumable file transfer - FIXED VERSION"""
             try:
-                while len(receiver.received_chunks) < total_chunks:
-                    # ✅ Check for completion signal and CONSUME it completely
-                    if b"TRANSFER_COMPLETE\n" in buffer:
-                        idx = buffer.find(b"TRANSFER_COMPLETE\n")
-                        buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
-                        self.log("✅ Received TRANSFER_COMPLETE signal (continuing connection)")
-                        break
-                    
-                    # Read chunk header (72 bytes)
-                    while len(buffer) < 72 and b"TRANSFER_COMPLETE\n" not in buffer:
-                        chunk = self.client_socket.recv(BUFFER_SIZE)
-                        if not chunk:
-                            break
-                        buffer += chunk
-                    
-                    # Check again after receiving data
-                    if b"TRANSFER_COMPLETE\n" in buffer:
-                        idx = buffer.find(b"TRANSFER_COMPLETE\n")
-                        buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
-                        self.log("✅ Received TRANSFER_COMPLETE signal (continuing connection)")
-                        break
-                    
-                    if len(buffer) < 72:
-                        break
-                    
-                    # Parse header
-                    chunk_index, chunk_size = struct.unpack(">II", buffer[:8])
-                    checksum = buffer[8:72].rstrip(b'\x00').decode('utf-8')
-                    buffer = buffer[72:]
-                    
-                    # Read chunk data
-                    while len(buffer) < chunk_size:
-                        buffer += self.client_socket.recv(min(BUFFER_SIZE, chunk_size - len(buffer)))
-                    
-                    chunk_data = buffer[:chunk_size]
-                    buffer = buffer[chunk_size:]
-                    
-                    # Skip if already received
-                    if receiver.is_chunk_received(chunk_index):
-                        self.client_socket.sendall(b"CHUNK_OK\n")
-                        continue
-                    
-                    # Verify and save
-                    try:
-                        receiver.save_chunk(chunk_index, chunk_data, checksum)
-                        chunk_data_map[chunk_index] = chunk_data
-                        self.client_socket.sendall(b"CHUNK_OK\n")
-                        
-                        # Update progress
-                        if time.time() - last_update >= 1.0:
-                            progress = receiver.get_progress()
-                            self.signals.file_progress.emit(int(progress), f"{filename}: {progress:.0f}%")
-                            last_update = time.time()
-                    
-                    except Exception as e:
-                        self.log(f"Chunk {chunk_index} error: {e}")
-                        self.client_socket.sendall(b"CHUNK_ERROR\n")
-                        break
-            
-            finally:
-                self.client_socket.settimeout(None)
-            
-            # Check completion
-            if receiver.is_complete():
-                self.log(f"Writing {total_chunks} chunks to disk...")
+                # Read header
+                while len(buffer) < 4:
+                    buffer += self.client_socket.recv(BUFFER_SIZE)
                 
-                with open(filepath, 'wb') as f:
-                    for i in range(total_chunks):
-                        if i in chunk_data_map:
-                            f.write(chunk_data_map[i])
+                header_len = struct.unpack(">I", buffer[:4])[0]
+                buffer = buffer[4:]
                 
-                # Send VERIFIED
+                while len(buffer) < header_len:
+                    buffer += self.client_socket.recv(BUFFER_SIZE)
+                
+                metadata = json.loads(buffer[:header_len].decode('utf-8'))
+                buffer = buffer[header_len:]
+                
+                transfer_id = metadata['transfer_id']
+                filename = metadata['filename']
+                destination = metadata['destination']
+                filesize = metadata['filesize']
+                total_chunks = metadata['total_chunks']
+                
+                self.log(f"📥 Receiving: {filename} ({filesize//1024//1024} MB)")
+                
+                receiver = ResumableFileReceiver(transfer_id, filename, destination, filesize, total_chunks)
+                filepath = self._resolve_destination_path(destination, filename)
+                
+                if not filepath:
+                    self.client_socket.sendall(b"ERROR\n")
+                    return buffer
+                
+                os.makedirs(os.path.dirname(filepath), exist_ok=True)
+                self.client_socket.sendall(b"READY\n")
+                
+                self.client_socket.settimeout(30.0)
+                chunk_data_map = {}
+                
                 try:
+                    while len(receiver.received_chunks) < total_chunks:
+                        # Check for completion signal
+                        if b"TRANSFER_COMPLETE\n" in buffer:
+                            idx = buffer.find(b"TRANSFER_COMPLETE\n")
+                            buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
+                            break
+                        
+                        # Read chunk header (72 bytes)
+                        while len(buffer) < 72 and b"TRANSFER_COMPLETE\n" not in buffer:
+                            buffer += self.client_socket.recv(BUFFER_SIZE)
+                        
+                        if b"TRANSFER_COMPLETE\n" in buffer:
+                            idx = buffer.find(b"TRANSFER_COMPLETE\n")
+                            buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
+                            break
+                        
+                        if len(buffer) < 72:
+                            break
+                        
+                        chunk_index, chunk_size = struct.unpack(">II", buffer[:8])
+                        checksum = buffer[8:72].rstrip(b'\x00').decode('utf-8')
+                        buffer = buffer[72:]
+                        
+                        # Read chunk data
+                        while len(buffer) < chunk_size:
+                            buffer += self.client_socket.recv(min(BUFFER_SIZE, chunk_size - len(buffer)))
+                        
+                        chunk_data = buffer[:chunk_size]
+                        buffer = buffer[chunk_size:]
+                        
+                        if receiver.is_chunk_received(chunk_index):
+                            self.client_socket.sendall(b"CHUNK_OK\n")
+                            continue
+                        
+                        try:
+                            receiver.save_chunk(chunk_index, chunk_data, checksum)
+                            chunk_data_map[chunk_index] = chunk_data
+                            self.client_socket.sendall(b"CHUNK_OK\n")
+                        except Exception as e:
+                            self.log(f"Chunk {chunk_index} error: {e}")
+                            self.client_socket.sendall(b"CHUNK_ERROR\n")
+                            break
+                
+                finally:
+                    self.client_socket.settimeout(None)
+                
+                # Write complete file
+                if receiver.is_complete():
+                    with open(filepath, 'wb') as f:
+                        for i in range(total_chunks):
+                            if i in chunk_data_map:
+                                f.write(chunk_data_map[i])
+                    
                     self.client_socket.sendall(b"VERIFIED\n")
-                    self.log("Sent VERIFIED (staying connected)")
-                except:
-                    pass
-                
-                receiver.cleanup()
-                
-                self.signals.file_progress.emit(100, f"Complete: {filename}")
-                self.log(f"✅ Saved: {filepath}")
-                
-                self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
-                QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
+                    receiver.cleanup()
+                    
+                    self.signals.file_progress.emit(100, f"Complete: {filename}")
+                    self.log(f"✅ Saved: {filepath}")
+                    self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
             
-            else:
-                progress = receiver.get_progress()
-                self.log(f"⚠️ Incomplete: {progress:.0f}%")
-                self.signals.file_progress.emit(int(progress), f"Paused: {progress:.0f}%")
-        
-        except Exception as e:
-            self.log(f"❌ Transfer error: {e}")
-            import traceback
-            self.log(f"Traceback: {traceback.format_exc()}")
-            self.signals.file_progress.emit(0, f"Error: {str(e)}")
-        
-        return buffer  # ✅ ALWAYS return buffer to continue listening
+            except Exception as e:
+                self.log(f"❌ Transfer error: {e}")
+            
+            return buffer
  # -----------------------------------------------------------------------------------------------------------------------------       
         # 3. Add these methods to StudentClient class:
     def _show_presentation(self, _):
@@ -1038,11 +990,8 @@ class StudentClient(QWidget):
 
     def process_command(self, command):
         """Process received command"""
-        # Skip transfer protocol signals
         if command.upper() in ["TRANSFER_COMPLETE", "VERIFIED", "CHUNK_OK", "CHUNK_ERROR", "READY"]:
             return
-        
-        print(f"[DEBUG] Processing command: '{command}'")
         
         if command == "LOCK":
             self.lock_screen()
@@ -1061,7 +1010,52 @@ class StudentClient(QWidget):
         elif command.startswith("MESSAGE:"):
             msg = command[8:]
             self.signals.show_message.emit("Message from Admin", msg)
+        elif command.startswith("{") and "SEND_FILE_TO_ADMIN" in command:
+            # Handle file upload request
+            try:
+                request = json.loads(command)
+                filepath = request.get("filepath")
+                threading.Thread(target=self.send_file_to_admin, args=(filepath,), daemon=True).start()
+            except Exception as e:
+                self.log(f"Error parsing file request: {e}")
+    
+    def send_file_to_admin(self, filepath):
+        """Send a file to admin server"""
+        try:
+            if not os.path.exists(filepath):
+                self.log(f"File not found: {filepath}")
+                return
             
+            filesize = os.path.getsize(filepath)
+            filename = os.path.basename(filepath)
+            
+            self.log(f"📤 Sending file to admin: {filename} ({filesize//1024} KB)")
+            
+            # Send header
+            metadata = {
+                "filename": filename,
+                "filesize": filesize
+            }
+            meta_json = json.dumps(metadata).encode('utf-8')
+            
+            header = b"FILE\n" + struct.pack(">I", len(meta_json)) + meta_json
+            header += struct.pack(">Q", filesize)
+            
+            self.client_socket.sendall(header)
+            
+            # Send file data
+            with open(filepath, 'rb') as f:
+                while True:
+                    chunk = f.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    self.client_socket.sendall(chunk)
+            
+            self.log(f"✅ File sent successfully: {filename}")
+            
+        except Exception as e:
+            self.log(f"❌ File send error: {e}")
+             
     def _create_lock_overlay(self, logo_path):
         """Create lock overlay on main thread"""
         print(f"[DEBUG] _create_lock_overlay() called")
