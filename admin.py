@@ -277,7 +277,24 @@ class ClientHandler:
             return False
 
     # In admin_server.py, ClientHandler class:
-
+    def request_file_from_client(self, remote_path: str, save_to: str = None):
+        """Request a file from client's filesystem"""
+        try:
+            save_to = save_to or INBOX_DIR
+            
+            # Send request
+            request = json.dumps({
+                "command": "SEND_FILE_TO_ADMIN",
+                "filepath": remote_path
+            })
+            self.send_command(request)
+            
+            self.server.log(f"📥 Requesting file from {self.key}: {remote_path}")
+            return True
+            
+        except Exception as e:
+            self.server.log(f"❌ File request error: {e}")
+            return False
     # In ClientHandler class, update send_file_resumable method:
 
     def send_file_resumable(self, filepath: str, destination: str = None):
@@ -293,7 +310,6 @@ class ClientHandler:
             
             self.server.log(f"📤 Starting transfer: {basename} ({format_bytes(filesize)})")
             
-            # Check resume status
             pending_chunks = transfer.get_pending_chunks()
             if len(pending_chunks) < transfer.total_chunks:
                 self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} chunks done")
@@ -322,15 +338,12 @@ class ClientHandler:
             with self.lock:
                 self.sock.sendall(header)
                 
-                # Wait for READY with timeout
+                # Wait for READY
                 self.sock.settimeout(15.0)
                 try:
                     ack = self.sock.recv(1024)
                     if b"READY" not in ack:
                         raise Exception(f"Client not ready: {ack}")
-                    self.server.log("✅ Client READY")
-                except socket.timeout:
-                    raise Exception("Timeout waiting for READY")
                 finally:
                     self.sock.settimeout(None)
                 
@@ -340,64 +353,45 @@ class ClientHandler:
                 
                 with open(filepath, "rb") as f:
                     for chunk_index in pending_chunks:
-                        try:
-                            # Read chunk
-                            f.seek(chunk_index * CHUNK_SIZE)
-                            chunk_data = f.read(CHUNK_SIZE)
-                            if not chunk_data:
-                                break
-                            
-                            # Calculate checksum
-                            checksum = transfer._calculate_chunk_checksum(chunk_data)
-                            
-                            # Send chunk header + data
-                            chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
-                            chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
-                            self.sock.sendall(chunk_header + chunk_data)
-                            
-                            # Wait for ACK with short timeout
-                            self.sock.settimeout(5.0)
-                            try:
-                                chunk_ack = self.sock.recv(32)
-                                if b"CHUNK_OK" not in chunk_ack:
-                                    raise Exception(f"Chunk {chunk_index} failed")
-                            except socket.timeout:
-                                raise Exception(f"Timeout on chunk {chunk_index}")
-                            finally:
-                                self.sock.settimeout(None)
-                            
-                            # Mark complete
-                            transfer.mark_chunk_complete(chunk_index, checksum)
-                            sent_bytes += len(chunk_data)
-                            
-                            # Log progress every 2 seconds
-                            if time.time() - start_time >= 2.0:
-                                progress = transfer.get_progress()
-                                speed = sent_bytes / (time.time() - start_time)
-                                self.server.log(f"📊 {progress:.1f}% | {format_bytes(speed)}/s")
-                                start_time = time.time()
-                                sent_bytes = 0
+                        f.seek(chunk_index * CHUNK_SIZE)
+                        chunk_data = f.read(CHUNK_SIZE)
+                        if not chunk_data:
+                            break
                         
-                        except Exception as e:
-                            self.server.log(f"❌ Chunk {chunk_index} error: {e}")
-                            raise
+                        checksum = transfer._calculate_chunk_checksum(chunk_data)
+                        chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
+                        chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
+                        self.sock.sendall(chunk_header + chunk_data)
+                        
+                        # Wait for ACK
+                        self.sock.settimeout(5.0)
+                        try:
+                            chunk_ack = self.sock.recv(32)
+                            if b"CHUNK_OK" not in chunk_ack:
+                                raise Exception(f"Chunk {chunk_index} failed")
+                        finally:
+                            self.sock.settimeout(None)
+                        
+                        transfer.mark_chunk_complete(chunk_index, checksum)
+                        sent_bytes += len(chunk_data)
+                        
+                        # Log progress
+                        if time.time() - start_time >= 2.0:
+                            progress = transfer.get_progress()
+                            speed = sent_bytes / (time.time() - start_time)
+                            self.server.log(f"📊 {progress:.1f}% | {format_bytes(speed)}/s")
+                            start_time = time.time()
+                            sent_bytes = 0
                 
-                # ✅ FIX: Send completion WITHOUT waiting for response
+                # Send completion (don't wait for response)
                 self.sock.sendall(b"TRANSFER_COMPLETE\n")
-                
-                # ✅ FIX: DON'T read VERIFIED here - let _reader_loop handle it
-                # The main reader loop will naturally see the VERIFIED response
-            
-            elapsed = time.time() - start_time
-            speed = filesize / elapsed if elapsed > 0 else 0
-            self.server.log(f"✅ Complete: {basename} | {format_bytes(speed)}/s")
             
             transfer.cleanup()
+            self.server.log(f"✅ Complete: {basename}")
             return True
             
         except Exception as e:
             self.server.log(f"❌ Transfer error: {e}")
-            self.server.log("💾 Progress saved - can resume")
             return False
 
     def resume_file_transfer(self, transfer_id: str):
@@ -1331,6 +1325,10 @@ class AdminWindow(QMainWindow):
         btn_broadcast.clicked.connect(self.broadcast_message)
         msg_layout.addWidget(btn_broadcast)
         
+        btn_request_file = QPushButton("📥 Request File from Client")
+        btn_request_file.clicked.connect(self.request_file_from_selected)
+        file_layout.addWidget(btn_request_file)
+        
         right_layout.addWidget(msg_group)
         
         right_layout.addStretch()
@@ -1339,7 +1337,30 @@ class AdminWindow(QMainWindow):
         
         return widget
 
-
+    def request_file_from_selected(self):
+        """Request file from selected clients"""
+        keys = self._get_selected_keys()
+        if not keys:
+            QMessageBox.warning(self, "No Selection", "Please select one or more clients")
+            return
+        
+        filepath, ok = QInputDialog.getText(
+            self, "Request File",
+            "Enter full path on client machine:\n(e.g., C:\\Users\\Student\\Desktop\\file.txt)"
+        )
+        
+        if not ok or not filepath:
+            return
+        
+        with self.server.clients_lock:
+            for k in keys:
+                if k in self.server.clients:
+                    self.server.clients[k].request_file_from_client(filepath)
+        
+        QMessageBox.information(
+            self, "File Request",
+            f"Requested file from {len(keys)} client(s):\n{filepath}"
+        )
     # Add this new method to AdminWindow class:
     def send_command_to_selected(self, command):
         """Send a specific command to selected clients"""
