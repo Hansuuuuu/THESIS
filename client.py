@@ -22,7 +22,7 @@ from PIL import ImageGrab
 # ==============================
 # Configuration
 # ==============================
-SERVER_HOST = '192.168.68.110'  # Change this to admin/teacher IP
+SERVER_HOST = '192.168.68.103'  # Change this to admin/teacher IP
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000  # milliseconds
