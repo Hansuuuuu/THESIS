@@ -11,6 +11,8 @@ import struct
 import time
 import json
 import hashlib
+import zipfile
+import shutil
 from datetime import datetime
 import traceback
 import io
@@ -35,7 +37,7 @@ from PyQt5.QtGui import QPixmap, QIcon, QFont, QImage, QPainter, QColor
 from PyQt5.QtCore import QByteArray
 
 # Configuration
-SERVER_HOST = '192.168.68.103'  # Change to admin IP if on different computer
+SERVER_HOST = '192.168.100.30'  # Change to admin IP if on different computer
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000  # 5 seconds
@@ -44,7 +46,7 @@ CHUNK_SIZE = 4 * 1024 * 1024
 SOCKET_SEND_BUFFER = 16 * 1024 * 1024
 SOCKET_RECV_BUFFER = 16 * 1024 * 1024
 BATCH_ACK_SIZE = 10
-
+RESTORE_TEMP_DIR = os.path.join(os.path.expanduser("~"), "lab_restore_temp")  # NEW: Temporary restore location
 RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache_client")
 os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
 
@@ -1110,6 +1112,314 @@ class StudentClient(QWidget):
             self.sharing_active = False
         
         threading.Thread(target=share_loop, daemon=True).start()
+    
+    def receive_loop(self):
+        buffer = b""
+        
+        while self.connected and self.running:
+            try:
+                chunk = self.client_socket.recv(BUFFER_SIZE)
+                if not chunk:
+                    break
+                
+                buffer += chunk
+                
+                while b"\n" in buffer:
+                    idx = buffer.find(b"\n")
+                    line = buffer[:idx]
+                    buffer = buffer[idx + 1:]
+                    
+                    if line.startswith(b"INIT"):
+                        buffer = self.handle_file_transfer_init(buffer)
+                    
+                    elif line.startswith(b"LOCK:"):
+                        message = line[5:].decode("utf-8", errors="ignore")
+                        self.lock_signals.lock_requested.emit(message)
+                    
+                    elif line == b"UNLOCK":
+                        self.lock_signals.unlock_requested.emit()
+                    
+                    elif line.startswith(b"MESSAGE:"):
+                        message = line[8:].decode("utf-8", errors="ignore")
+                        self.signals.show_message.emit("Message from Admin", message)
+                    
+                    elif line == b"REQUEST_SCREENSHOT":
+                        threading.Thread(target=self.send_screen_once, daemon=True).start()
+                    
+                    elif line == b"PRESENT_START":
+                        self.start_presentation_mode()
+                    
+                    elif line == b"PRESENT_STOP":
+                        self.stop_presentation_mode()
+                    
+                    elif line.startswith(b"PRESENT_FRAME"):
+                        if len(buffer) >= 8:
+                            size = struct.unpack(">Q", buffer[:8])[0]
+                            buffer = buffer[8:]
+                            
+                            while len(buffer) < size:
+                                chunk = self.client_socket.recv(BUFFER_SIZE)
+                                if not chunk:
+                                    break
+                                buffer += chunk
+                            
+                            frame_data = buffer[:size]
+                            buffer = buffer[size:]
+                            
+                            if self.presentation_overlay:
+                                self.presentation_overlay.update_frame(frame_data)
+                    
+                    # NEW: Handle backup request
+                    elif line.startswith(b"BACKUP_REQUEST:"):
+                        source_path = line[15:].decode("utf-8", errors="ignore")
+                        threading.Thread(target=self.handle_backup_request, 
+                                       args=(source_path,), daemon=True).start()
+                    
+                    # NEW: Handle restore request
+                    elif line.startswith(b"RESTORE_START:"):
+                        restore_path = line[14:].decode("utf-8", errors="ignore")
+                        self.restore_target_path = restore_path
+                        self.log(f"📥 Restore initiated to: {restore_path}")
+            
+            except Exception as e:
+                if self.connected:
+                    self.log(f"⚠️ Receive error: {e}")
+                break
+        
+        self.log("🔌 Disconnected from server")
+        self.disconnect_socket()
+        self.signals.update_status.emit("⚪ Disconnected", "red")
+        
+        if self.running:
+            QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
+    
+    # NEW: Handle backup request from admin
+    def handle_backup_request(self, source_path):
+        try:
+            self.log(f"💾 Backup requested: {source_path}")
+            
+            if not os.path.exists(source_path):
+                error_msg = f"Path not found: {source_path}"
+                self.log(f"❌ {error_msg}")
+                self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
+                return
+            
+            # Create temporary zip file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_zip = os.path.join(RESUME_METADATA_DIR, f"backup_{timestamp}.zip")
+            
+            self.log(f"📦 Creating backup archive...")
+            
+            with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                if os.path.isfile(source_path):
+                    zipf.write(source_path, os.path.basename(source_path))
+                else:
+                    for root, dirs, files in os.walk(source_path):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            arcname = os.path.relpath(file_path, source_path)
+                            try:
+                                zipf.write(file_path, arcname)
+                            except Exception as e:
+                                self.log(f"⚠️ Skipped: {file} ({e})")
+            
+            # Read zip file
+            with open(temp_zip, 'rb') as f:
+                zip_data = f.read()
+            
+            # Send backup data
+            self.log(f"📤 Sending backup ({format_bytes(len(zip_data))})...")
+            header = f"BACKUP_DATA:{len(zip_data)}\n".encode("utf-8")
+            self.client_socket.sendall(header + zip_data)
+            
+            # Clean up
+            try:
+                os.remove(temp_zip)
+            except:
+                pass
+            
+            self.log(f"✅ Backup sent successfully")
+            self.signals.show_message.emit("Backup Complete", 
+                                          f"Files backed up to admin from:\n{source_path}")
+        
+        except Exception as e:
+            error_msg = f"Backup failed: {e}"
+            self.log(f"❌ {error_msg}")
+            try:
+                self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
+            except:
+                pass
+    
+    def handle_file_transfer_init(self, buffer):
+        try:
+            if len(buffer) < 8:
+                return buffer
+            
+            size = struct.unpack(">Q", buffer[:8])[0]
+            buffer = buffer[8:]
+            
+            while len(buffer) < size:
+                chunk = self.client_socket.recv(BUFFER_SIZE)
+                if not chunk:
+                    break
+                buffer += chunk
+            
+            init_data = buffer[:size]
+            buffer = buffer[size:]
+            
+            init_info = json.loads(init_data.decode("utf-8"))
+            
+            transfer_id = init_info["transfer_id"]
+            filename = init_info["filename"]
+            destination = init_info["destination"]
+            filesize = init_info["filesize"]
+            total_chunks = init_info["total_chunks"]
+            chunk_size = init_info["chunk_size"]
+            
+            # NEW: Check if this is a restore operation
+            is_restore = destination == "RESTORE_TEMP"
+            
+            if is_restore:
+                filepath = os.path.join(RESTORE_TEMP_DIR, filename)
+                self.log(f"📥 Receiving restore file: {filename}")
+            else:
+                filepath = self._resolve_destination_path(destination, filename)
+                if not filepath:
+                    return buffer
+                self.log(f"📥 Receiving: {filename} ({format_bytes(filesize)})")
+            
+            self.signals.file_progress.emit(0, f"Starting: {filename}")
+            
+            receiver = ResumableFileReceiver(transfer_id, filename, destination, filesize, total_chunks)
+            
+            chunk_data_map = {}
+            chunks_since_ack = 0
+            last_update = time.time()
+            
+            try:
+                while not receiver.is_complete():
+                    if len(buffer) < 6:
+                        chunk = self.client_socket.recv(BUFFER_SIZE)
+                        if not chunk:
+                            break
+                        buffer += chunk
+                    
+                    if buffer[:6] == b"CHUNK\n":
+                        buffer = buffer[6:]
+                        
+                        while len(buffer) < 16:
+                            chunk = self.client_socket.recv(BUFFER_SIZE)
+                            if not chunk:
+                                break
+                            buffer += chunk
+                        
+                        chunk_index, chunk_len = struct.unpack(">QQ", buffer[:16])
+                        buffer = buffer[16:]
+                        
+                        while len(buffer) < chunk_len:
+                            chunk = self.client_socket.recv(BUFFER_SIZE)
+                            if not chunk:
+                                break
+                            buffer += chunk
+                        
+                        chunk_data = buffer[:chunk_len]
+                        buffer = buffer[chunk_len:]
+                        
+                        if not receiver.is_chunk_received(chunk_index):
+                            chunk_data_map[chunk_index] = chunk_data
+                            checksum = receiver._calculate_chunk_checksum(chunk_data)
+                            receiver.received_chunks[chunk_index] = checksum
+                            chunks_since_ack += 1
+                        
+                        progress = receiver.get_progress()
+                        current_time = time.time()
+                        if current_time - last_update >= 0.5:
+                            self.signals.file_progress.emit(int(progress), 
+                                                           f"{filename}: {progress:.1f}%")
+                            last_update = time.time()
+                    
+                    elif buffer[:18] == b"TRANSFER_COMPLETE\n":
+                        buffer = buffer[18:]
+                        break
+                    
+                    if chunks_since_ack >= BATCH_ACK_SIZE:
+                        receiver._save_progress()
+                        chunks_since_ack = 0
+                        last_update = time.time()
+                
+                if chunks_since_ack > 0:
+                    try:
+                        self.client_socket.sendall(b"CHUNK_OK\n")
+                    except:
+                        pass
+            
+            except Exception as e:
+                self.log(f"Transfer error: {e}")
+                raise
+            
+            if receiver.is_complete():
+                self.log(f"Writing to disk...")
+                try:
+                    with open(filepath, "wb") as f:
+                        for i in range(total_chunks):
+                            if i in chunk_data_map:
+                                f.write(chunk_data_map[i])
+                    
+                    try:
+                        self.client_socket.sendall(b"VERIFIED\n")
+                    except:
+                        pass
+                    
+                    receiver.cleanup()
+                    self.signals.file_progress.emit(100, f"Complete: {filename}")
+                    self.log(f"✅ Saved: {filepath}")
+                    
+                    # NEW: Handle restore extraction
+                    if is_restore:
+                        threading.Thread(target=self.extract_restore_files, 
+                                       args=(filepath,), daemon=True).start()
+                    else:
+                        self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
+                    
+                    QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
+                
+                except Exception as e:
+                    self.log(f"Write error: {e}")
+                    raise
+        
+        except Exception as e:
+            self.log(f"Transfer error: {e}")
+            self.signals.file_progress.emit(0, f"Error")
+        
+        return buffer
+    
+    # NEW: Extract and restore files
+    def extract_restore_files(self, zip_path):
+        try:
+            self.log(f"📦 Extracting restore files...")
+            
+            restore_path = getattr(self, 'restore_target_path', None)
+            if not restore_path:
+                restore_path = os.path.join(os.path.expanduser("~"), "Documents", "RestoredFiles")
+            
+            os.makedirs(restore_path, exist_ok=True)
+            
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(restore_path)
+            
+            # Clean up
+            try:
+                os.remove(zip_path)
+            except:
+                pass
+            
+            self.log(f"✅ Files restored to: {restore_path}")
+            self.signals.show_message.emit("Restore Complete", 
+                                          f"Files restored to:\n{restore_path}")
+        
+        except Exception as e:
+            self.log(f"❌ Restore extraction failed: {e}")
+            self.signals.show_message.emit("Restore Error", f"Failed to extract files: {e}")
     
     def stop_screen_share(self):
         if getattr(self, 'sharing_active', False):
