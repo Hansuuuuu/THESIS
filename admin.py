@@ -64,6 +64,155 @@ def format_bytes(size):
 
 class ServerSignals(QObject):
     new_frame = pyqtSignal(str, bytes)
+    
+    
+class FileSyncManager:
+    """Automatically syncs files from all connected clients"""
+    
+    def __init__(self, server, base_sync_dir=None):
+        self.server = server
+        self.base_sync_dir = base_sync_dir or os.path.join(os.path.expanduser("~"), "lab_sync")
+        os.makedirs(self.base_sync_dir, exist_ok=True)
+        
+        # Track file hashes to detect changes
+        self.file_hashes = {}  # {client_key: {file_path: hash}}
+        self.client_configs = {}  # {client_key: source_path}
+        self.sync_thread = None
+        self.sync_running = False
+        self.server.log(f"File sync manager initialized at {self.base_sync_dir}")
+    
+    def set_global_source_path(self, source_path):
+        """Set the source path for ALL clients"""
+        self.global_source_path = source_path
+        self.server.log(f"Global source path set to: {source_path}")
+    
+    def start_sync_cycle(self, sync_interval=30):
+        """Start automatic sync for ALL connected clients"""
+        if self.sync_running:
+            self.server.log("Sync cycle already running")
+            return
+        
+        if not hasattr(self, 'global_source_path'):
+            self.server.log("ERROR: Source path not configured")
+            return
+        
+        self.sync_running = True
+        self.server.log(f"Starting AUTO SYNC for ALL clients (interval: {sync_interval}s)")
+        
+        def sync_loop():
+            while self.sync_running:
+                try:
+                    clients = self.server.list_clients()
+                    if clients:
+                        self.server.log(f"Syncing {len(clients)} connected clients...")
+                        for client_key in clients:
+                            self._sync_client_files(client_key, self.global_source_path)
+                    time.sleep(sync_interval)
+                except Exception as e:
+                    self.server.log(f"Sync cycle error: {e}")
+                    time.sleep(5)
+        
+        self.sync_thread = threading.Thread(target=sync_loop, daemon=True)
+        self.sync_thread.start()
+    
+    def stop_sync_cycle(self):
+        """Stop the automatic sync cycle"""
+        self.sync_running = False
+        self.server.log("AUTO SYNC stopped")
+    
+    def _sync_client_files(self, client_key, source_path):
+        """Trigger file collection from a client"""
+        # Send command to client to collect files
+        cmd = f"COLLECT_FILES:{source_path}"
+        
+        with self.server.clients_lock:
+            if client_key in self.server.clients:
+                handler = self.server.clients[client_key]
+                handler.send_command(cmd)
+    
+    def receive_file_list(self, client_key, files_data):
+        """Receive and process file list from client"""
+        try:
+            files = json.loads(files_data)
+            client_sync_dir = os.path.join(self.base_sync_dir, client_key.replace(":", "_"))
+            os.makedirs(client_sync_dir, exist_ok=True)
+            
+            if client_key not in self.file_hashes:
+                self.file_hashes[client_key] = {}
+            
+            new_files = []
+            modified_files = []
+            
+            for file_info in files:
+                file_path = file_info["path"]
+                file_hash = file_info["hash"]
+                
+                # Check if file is new or modified
+                old_hash = self.file_hashes[client_key].get(file_path)
+                
+                if old_hash is None:
+                    new_files.append(file_path)
+                    self.server.log(f"NEW: {client_key} -> {file_path}")
+                elif old_hash != file_hash:
+                    modified_files.append(file_path)
+                    self.server.log(f"MODIFIED: {client_key} -> {file_path}")
+                
+                # Update hash record
+                self.file_hashes[client_key][file_path] = file_hash
+            
+            # Request all new and modified files
+            files_to_request = new_files + modified_files
+            for file_path in files_to_request:
+                self._request_file_from_client(client_key, file_path)
+            
+            if files_to_request:
+                self.server.log(f"Sync {client_key}: {len(new_files)} new, {len(modified_files)} modified")
+            
+        except Exception as e:
+            self.server.log(f"Error processing file list from {client_key}: {e}")
+    
+    def _request_file_from_client(self, client_key, file_path):
+        """Request a specific file from client"""
+        cmd = f"SEND_FILE_TO_ADMIN:{file_path}"
+        
+        with self.server.clients_lock:
+            if client_key in self.server.clients:
+                handler = self.server.clients[client_key]
+                handler.send_command(cmd)
+    
+    def receive_file_from_client(self, client_key, file_info, file_data):
+        """Receive and save file sent from client"""
+        try:
+            file_path = file_info.get("path", "unknown")
+            file_name = file_info.get("name", "file")
+            
+            # Create directory structure
+            client_dir = os.path.join(self.base_sync_dir, client_key.replace(":", "_"))
+            os.makedirs(client_dir, exist_ok=True)
+            
+            # Save file with relative path structure
+            relative_path = file_path.replace("\\", "/")
+            save_path = os.path.join(client_dir, relative_path.lstrip("/"))
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            
+            # Write file
+            with open(save_path, "wb") as f:
+                f.write(file_data)
+            
+            self.server.log(f"SAVED: {client_key} -> {save_path}")
+            
+        except Exception as e:
+            self.server.log(f"Error saving file from {client_key}: {e}")
+    
+    def get_sync_status(self):
+        """Get sync status"""
+        status = {
+            "running": self.sync_running,
+            "clients_syncing": len(self.file_hashes),
+            "total_files": sum(len(files) for files in self.file_hashes.values()),
+            "sync_dir": self.base_sync_dir
+        }
+        return status
 
 
 class ResumableFileTransfer:
@@ -857,6 +1006,9 @@ class AdminWindow(QMainWindow):
         
         self.tab_logs = self._create_logs_tab()
         self.tabs.addTab(self.tab_logs, "📋 Logs")
+        
+        self.tab_sync = self._create_sync_tab()
+        self.tabs.addTab(self.tab_sync, "💾 File Sync")
     
     def _create_control_tab(self):
         widget = QWidget()
@@ -1405,6 +1557,180 @@ class AdminWindow(QMainWindow):
                 event.ignore()
         else:
             event.accept()
+            
+    def _create_sync_tab(self):
+        """Create file sync management tab"""
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Title
+        title = QLabel("Automatic File Sync from All Clients")
+        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        title.setStyleSheet("color: #0078d4; padding: 10px;")
+        layout.addWidget(title)
+        
+        # Configuration
+        config_group = QGroupBox("Global Configuration")
+        config_layout = QVBoxLayout(config_group)
+        
+        config_layout.addWidget(QLabel("Source path to sync from ALL clients:"))
+        
+        path_layout = QHBoxLayout()
+        self.sync_path_input = QLineEdit()
+        self.sync_path_input.setText("D:\\")
+        path_layout.addWidget(self.sync_path_input)
+        
+        btn_preset = QPushButton("Preset Paths")
+        btn_preset.clicked.connect(self.show_preset_paths)
+        path_layout.addWidget(btn_preset)
+        
+        config_layout.addLayout(path_layout)
+        
+        layout.addWidget(config_group)
+        
+        # Control buttons
+        control_layout = QHBoxLayout()
+        
+        self.btn_start_all_sync = QPushButton("Start AUTO SYNC ALL")
+        self.btn_start_all_sync.setStyleSheet("""
+            QPushButton {
+                background-color: #28a745;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background-color: #218838;
+            }
+        """)
+        self.btn_start_all_sync.clicked.connect(self.start_all_sync)
+        control_layout.addWidget(self.btn_start_all_sync)
+        
+        self.btn_stop_all_sync = QPushButton("Stop AUTO SYNC")
+        self.btn_stop_all_sync.setStyleSheet("""
+            QPushButton {
+                background-color: #dc3545;
+                color: white;
+                font-weight: bold;
+                padding: 10px;
+            }
+            QPushButton:hover {
+                background-color: #c82333;
+            }
+        """)
+        self.btn_stop_all_sync.clicked.connect(self.stop_all_sync)
+        self.btn_stop_all_sync.setEnabled(False)
+        control_layout.addWidget(self.btn_stop_all_sync)
+        
+        layout.addLayout(control_layout)
+        
+        # Status display
+        layout.addWidget(QLabel("Sync Activity Log:"))
+        self.sync_activity_log = QTextEdit()
+        self.sync_activity_log.setReadOnly(True)
+        self.sync_activity_log.setMaximumHeight(250)
+        layout.addWidget(self.sync_activity_log)
+        
+        # Status info
+        layout.addWidget(QLabel("Sync Status:"))
+        self.sync_info_label = QLabel()
+        self.sync_info_label.setStyleSheet("background-color: #2a2a2a; padding: 10px; border-radius: 5px;")
+        layout.addWidget(self.sync_info_label)
+        
+        # Open sync folder
+        btn_open_sync = QPushButton("Open Sync Folder")
+        btn_open_sync.clicked.connect(self.open_sync_folder)
+        layout.addWidget(btn_open_sync)
+        
+        layout.addStretch()
+        
+        return widget
+
+
+    def show_preset_paths(self):
+        """Show preset path options"""
+        paths = ["D:\\", "C:\\Users\\Public", "C:\\Windows\\Temp", "Custom..."]
+        path, ok = QInputDialog.getItem(self, "Select Path", "Common source paths:", paths)
+        
+        if ok:
+            if path == "Custom...":
+                custom, ok = QInputDialog.getText(self, "Custom Path", "Enter path:")
+                if ok:
+                    self.sync_path_input.setText(custom)
+            else:
+                self.sync_path_input.setText(path)
+
+
+    def start_all_sync(self):
+        """Start auto-sync for ALL clients"""
+        source_path = self.sync_path_input.text()
+        
+        if not source_path:
+            QMessageBox.warning(self, "Error", "Please enter a source path")
+            return
+        
+        if not hasattr(self, "file_sync_manager"):
+            self.file_sync_manager = FileSyncManager(self.server)
+        
+        self.file_sync_manager.set_global_source_path(source_path)
+        
+        # Ask for sync interval
+        interval, ok = QInputDialog.getInt(
+            self,
+            "Sync Interval",
+            "Sync every X seconds:",
+            30, 5, 300
+        )
+        
+        if ok:
+            self.file_sync_manager.start_sync_cycle(interval)
+            self.btn_start_all_sync.setEnabled(False)
+            self.btn_stop_all_sync.setEnabled(True)
+            
+            msg = f"AUTO SYNC STARTED\nSource path: {source_path}\nInterval: {interval}s"
+            self.server.log(f"AUTO SYNC: {msg.replace(chr(10), ' ')}")
+            QMessageBox.information(self, "Started", msg)
+
+
+    def stop_all_sync(self):
+        """Stop auto-sync"""
+        if hasattr(self, "file_sync_manager"):
+            self.file_sync_manager.stop_sync_cycle()
+            self.btn_start_all_sync.setEnabled(True)
+            self.btn_stop_all_sync.setEnabled(False)
+            QMessageBox.information(self, "Stopped", "AUTO SYNC stopped")
+
+
+    def open_sync_folder(self):
+        """Open sync folder in file explorer"""
+        if hasattr(self, "file_sync_manager"):
+            folder = self.file_sync_manager.base_sync_dir
+            try:
+                if sys.platform.startswith("win"):
+                    os.startfile(folder)
+                elif sys.platform.startswith("darwin"):
+                    os.system(f"open '{folder}'")
+                else:
+                    os.system(f"xdg-open '{folder}'")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not open folder: {e}")
+
+
+    def _update_sync_info(self):
+        """Update sync status display (call this periodically)"""
+        if not hasattr(self, "file_sync_manager"):
+            return
+        
+        status = self.file_sync_manager.get_sync_status()
+        
+        info_text = f"""
+        Sync Running: {'YES' if status['running'] else 'NO'}
+        Clients Syncing: {status['clients_syncing']}
+        Total Files Collected: {status['total_files']}
+        Storage: {status['sync_dir']}
+        """
+        
+        self.sync_info_label.setText(info_text)
 
 
 def main():

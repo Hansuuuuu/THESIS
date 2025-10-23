@@ -736,7 +736,7 @@ class StudentClient(QWidget):
                 args=(source_path,),
                 daemon=True
             ).start()
-    
+        
         elif command.startswith("SEND_FILE_TO_ADMIN:"):
             file_path = command.split(":", 1)[1]
             threading.Thread(
@@ -1177,7 +1177,90 @@ class StudentClient(QWidget):
         else:
             event.ignore()
             self.showMinimized()
+        
 
+    def collect_and_send_files(self, source_path):
+        """Collect files from source path and send list to admin"""
+        try:
+            self.log(f"Collecting files from: {source_path}")
+            files_data = []
+            
+            # Scan directory recursively
+            for root, dirs, files in os.walk(source_path):
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    try:
+                        # Calculate file hash for change detection
+                        file_hash = self._calculate_file_hash(file_path)
+                        
+                        files_data.append({
+                            "path": file_path,
+                            "name": filename,
+                            "hash": file_hash,
+                            "size": os.path.getsize(file_path)
+                        })
+                    except Exception as e:
+                        pass  # Skip files that can't be read
+            
+            # Send file list to admin
+            file_list_json = json.dumps(files_data)
+            header = f"FILE_LIST:{len(file_list_json)}\n"
+            
+            self.client_socket.sendall(header.encode())
+            self.client_socket.sendall(file_list_json.encode())
+            
+            self.log(f"Sent file list: {len(files_data)} files from {source_path}")
+            
+        except Exception as e:
+            self.log(f"Error collecting files: {e}")
+
+
+    def send_file_to_admin(self, file_path):
+        """Send a specific file to admin"""
+        try:
+            if not os.path.exists(file_path):
+                return
+            
+            file_size = os.path.getsize(file_path)
+            
+            # Send file with special header
+            header = b"ADMIN_FILE\n"
+            metadata = {
+                "path": file_path,
+                "name": os.path.basename(file_path)
+            }
+            meta_json = json.dumps(metadata).encode()
+            meta_len = struct.pack(">I", len(meta_json))
+            
+            self.client_socket.sendall(header)
+            self.client_socket.sendall(meta_len)
+            self.client_socket.sendall(meta_json)
+            
+            # Send file
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    self.client_socket.sendall(chunk)
+            
+            self.client_socket.sendall(b"<END>")
+            self.log(f"File sent to admin: {os.path.basename(file_path)}")
+            
+        except Exception as e:
+            self.log(f"Error sending file to admin: {e}")
+
+
+    def _calculate_file_hash(self, file_path):
+        """Calculate SHA256 hash of file"""
+        sha256 = hashlib.sha256()
+        try:
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+        except:
+            return ""
 
 def main():
     try:
