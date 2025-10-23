@@ -3,6 +3,7 @@ Lab Manager - Admin Server - COMPLETE VERSION
 All features working: Lock/Unlock, Screen Monitoring, File Transfer, Presentation Mode
 """
 
+import shutil
 import sys
 import os
 import socket
@@ -11,6 +12,7 @@ import struct
 import time
 import json
 import hashlib
+import zipfile
 from pathlib import Path
 from datetime import datetime
 from queue import Queue, Empty
@@ -44,6 +46,7 @@ INBOX_DIR = os.path.join(os.path.expanduser("~"), "lab_inbox_admin")
 RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache")
 os.makedirs(INBOX_DIR, exist_ok=True)
 os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
+BACKUP_DIR = os.path.join(os.path.expanduser("~"), "ClientBackups")  # NEW: Main backup directory
 
 PRESENTATION_FPS = 30
 PRESENTATION_QUALITY = 85
@@ -334,9 +337,17 @@ class ClientHandler:
         try:
             data = (cmd_str + "\n").encode("utf-8")
             with self.lock:
+                # Ensure socket is in blocking mode for send
+                self.sock.setblocking(True)
+                self.sock.settimeout(5.0)
                 self.sock.sendall(data)
+                self.sock.setblocking(False)
+                self.sock.settimeout(None)
             self.server.log(f"✉️ Sent to {self.key}: {cmd_str}")
             return True
+        except socket.timeout:
+            self.server.log(f"⏱️ Send timeout to {self.key}: {cmd_str}")
+            return False
         except Exception as e:
             self.server.log(f"❌ Send error to {self.key}: {e}")
             return False
@@ -573,121 +584,373 @@ class ClientHandler:
         
         finally:
             self.transferring.clear()
+            
+            
+    # NEW: Request backup from client
+    def request_backup(self, source_path):
+        """Request client to backup a directory"""
+        try:
+            cmd = f"BACKUP_REQUEST:{source_path}"
+            return self.send_command(cmd)
+        except Exception as e:
+            self.server.log(f"❌ Backup request error: {e}")
+            return False
     
-    def _reader_loop(self):
-        sock = self.sock
-        sock.setblocking(True)
-        sock.settimeout(30.0)
+    # NEW: Send restore files to client
+    def send_restore(self, client_name, restore_path):
+        """Send backup files back to client"""
+        try:
+            backup_folder = os.path.join(BACKUP_DIR, client_name)
+            if not os.path.exists(backup_folder):
+                self.server.log(f"❌ No backup found for {client_name}")
+                return False
+            
+            # Create a temporary zip file
+            temp_zip = os.path.join(BACKUP_DIR, f"restore_{client_name}_{int(time.time())}.zip")
+            with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                for root, dirs, files in os.walk(backup_folder):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, backup_folder)
+                        zipf.write(file_path, arcname)
+            
+            # Send restore command with path
+            cmd = f"RESTORE_START:{restore_path}"
+            self.send_command(cmd)
+            time.sleep(0.5)
+            
+            # Send the zip file
+            success = self.send_file_resumable(temp_zip, "RESTORE_TEMP")
+            
+            # Clean up temp zip
+            try:
+                os.remove(temp_zip)
+            except:
+                pass
+            
+            return success
+        except Exception as e:
+            self.server.log(f"❌ Restore error: {e}")
+            return False
+    
+    def send_file_resumable(self, filepath, destination=None):
+        if not os.path.exists(filepath):
+            self.server.log(f"❌ File not found: {filepath}")
+            return False
+        
+        if not self.sock or not self.running.is_set():
+            self.server.log(f"⚠️ Client {self.key} not connected")
+            return False
+        
+        self.transferring.set()
         
         try:
-            buffer = b""
-            consecutive_errors = 0
-            max_consecutive_errors = 3
+            transfer = ResumableFileTransfer(filepath, destination or "Downloads")
+            basename = transfer.basename
+            filesize = transfer.filesize
+            chunk_size = transfer.chunk_size
             
-            while self.running.is_set():
-                if self.transferring.is_set():
-                    time.sleep(0.1)
-                    continue
+            self.server.log(f"📤 Starting: {basename} ({format_bytes(filesize)})")
+            
+            pending_chunks = transfer.get_pending_chunks()
+            if len(pending_chunks) < transfer.total_chunks:
+                self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} done")
+            
+            try:
+                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECV_BUFFER)
+            except:
+                pass
+            
+            init_header = {
+                "command": "RESUMABLE_TRANSFER_START",
+                "transfer_id": transfer.transfer_id,
+                "filename": basename,
+                "destination": transfer.destination,
+                "filesize": filesize,
+                "total_chunks": transfer.total_chunks,
+                "chunk_size": chunk_size
+            }
+            
+            init_json = json.dumps(init_header)
+            init_data = init_json.encode("utf-8")
+            size_bytes = struct.pack(">Q", len(init_data))
+            
+            with self.lock:
+                self.sock.sendall(b"INIT\n" + size_bytes + init_data)
+            
+            time.sleep(0.2)
+            
+            self.server.log(f"📦 Sending {len(pending_chunks)} chunks...")
+            
+            with open(filepath, 'rb') as f:
+                chunks_sent = 0
+                start_time = time.time()
+                last_log = start_time
                 
-                try:
-                    data = sock.recv(RECV_BUFFER)
-                    if not data:
-                        self.server.log(f"⚠️ Client {self.key} closed connection")
+                for chunk_index in pending_chunks:
+                    offset = chunk_index * chunk_size
+                    f.seek(offset)
+                    chunk_data = f.read(chunk_size)
+                    
+                    if not chunk_data:
                         break
                     
-                    consecutive_errors = 0
-                    buffer += data
+                    checksum = transfer._calculate_chunk_checksum(chunk_data)
+                    chunk_header = struct.pack(">QQ", chunk_index, len(chunk_data))
                     
-                    while b'\n' in buffer:
-                        line, buffer = buffer.split(b'\n', 1)
-                        header = line.decode('utf-8', errors='ignore').strip()
-                        if not header:
-                            continue
-                        
+                    with self.lock:
+                        self.sock.sendall(b"CHUNK\n" + chunk_header + chunk_data)
+                    
+                    chunks_sent += 1
+                    
+                    if chunks_sent % BATCH_ACK_SIZE == 0:
                         try:
+                            ack = self.sock.recv(1024)
+                            if b"CHUNK_OK" in ack:
+                                for i in range(chunks_sent - BATCH_ACK_SIZE, chunks_sent):
+                                    idx = pending_chunks[i] if i < len(pending_chunks) else chunk_index
+                                    transfer.mark_chunk_complete(idx, checksum)
+                                transfer.save_progress_batch()
+                        except:
+                            pass
+                    
+                    current_time = time.time()
+                    if current_time - last_log >= 2.0:
+                        elapsed = current_time - start_time
+                        speed = (chunks_sent * chunk_size) / elapsed if elapsed > 0 else 0
+                        progress = (chunks_sent / len(pending_chunks)) * 100
+                        self.server.log(f"📊 Progress: {progress:.1f}% ({format_bytes(speed)}/s)")
+                        last_log = current_time
+                    
+                    time.sleep(CHUNK_SEND_DELAY)
+                
+                remaining = chunks_sent % BATCH_ACK_SIZE
+                if remaining > 0:
+                    try:
+                        self.sock.sendall(b"CHUNK_OK\n")
+                        time.sleep(0.1)
+                    except:
+                        pass
+            
+            with self.lock:
+                self.sock.sendall(b"TRANSFER_COMPLETE\n")
+            
+            time.sleep(0.5)
+            
+            try:
+                response = self.sock.recv(1024)
+                if b"VERIFIED" in response:
+                    transfer.cleanup()
+                    elapsed = time.time() - start_time
+                    speed = filesize / elapsed if elapsed > 0 else 0
+                    self.server.log(f"✅ Transfer complete: {basename} ({format_bytes(speed)}/s)")
+                    return True
+            except:
+                pass
+            
+            self.server.log(f"⚠️ Transfer may be incomplete")
+            return False
+        
+        except Exception as e:
+            self.server.log(f"❌ Transfer error: {e}")
+            return False
+        
+        finally:
+            self.transferring.clear()
+            
+    def _reader_loop(self):
+            sock = self.sock
+            sock.setblocking(True)
+            sock.settimeout(30.0)
+
+            try:
+                buffer = b""
+                consecutive_errors = 0
+                max_consecutive_errors = 3
+
+                while self.running.is_set():
+                    if self.transferring.is_set():
+                        time.sleep(0.1)
+                        continue
+
+                    try:
+                        chunk = sock.recv(RECV_BUFFER)
+                        if not chunk:
+                            self.server.log(f"⚠️ Client {self.key} closed connection")
+                            break
+
+                        consecutive_errors = 0
+                        buffer += chunk
+                        self.bytes_received += len(chunk)
+                        self.last_heartbeat = time.time()  # Update heartbeat on ANY data received
+
+                        # Handle backup data reception
+                        if getattr(self, "backup_receiving", False):
+                            self.backup_buffer += chunk
+                            if len(self.backup_buffer) >= self.expected_backup_size:
+                                self._process_backup_data()
+                                self.backup_receiving = False
+                                buffer = self.backup_buffer[self.expected_backup_size:]
+                                self.backup_buffer = b""
+                            continue
+
+                        while b"\n" in buffer:
+                            idx = buffer.find(b"\n")
+                            if idx == -1:
+                                break
+
+                            line = buffer[:idx]
+                            buffer = buffer[idx + 1:]
+                            header = line.decode('utf-8', errors='ignore').strip()
+
+                            if not header:
+                                continue
+
+                            # --- Frame Handling ---
                             if header.upper() == "FRAME":
+                                # Wait for size header (8 bytes)
                                 while len(buffer) < 8:
                                     chunk = sock.recv(RECV_BUFFER)
                                     if not chunk:
                                         raise ConnectionError("Connection closed reading frame size")
                                     buffer += chunk
+                                    self.bytes_received += len(chunk)
+                                    self.last_heartbeat = time.time()
                                 
-                                size_bytes = buffer[:8]
+                                frame_size = struct.unpack(">Q", buffer[:8])[0]
                                 buffer = buffer[8:]
-                                size = struct.unpack(">Q", size_bytes)[0]
-                                
-                                if size <= 0 or size > MAX_IMAGE_SIZE:
-                                    self.server.log(f"⚠️ Invalid frame size: {size}")
+
+                                if frame_size <= 0 or frame_size > MAX_IMAGE_SIZE:
+                                    self.server.log(f"⚠️ Invalid frame size: {frame_size}")
                                     continue
-                                
-                                while len(buffer) < size:
-                                    chunk = sock.recv(min(RECV_BUFFER, size - len(buffer)))
+
+                                # Wait for complete frame data
+                                while len(buffer) < frame_size:
+                                    chunk = sock.recv(min(RECV_BUFFER, frame_size - len(buffer)))
                                     if not chunk:
-                                        raise ConnectionError("Connection closed reading frame")
+                                        raise ConnectionError("Connection closed reading frame data")
                                     buffer += chunk
+                                    self.bytes_received += len(chunk)
+                                    self.last_heartbeat = time.time()
                                 
-                                frame_data = buffer[:size]
-                                buffer = buffer[size:]
+                                frame_data = buffer[:frame_size]
+                                buffer = buffer[frame_size:]
                                 
-                                self.last_image = frame_data
-                                self.last_image_ts = time.time()
-                                self.frames_received += 1
-                                self.bytes_received += len(frame_data)
-                                
-                                if hasattr(self.server, "signals"):
-                                    self.server.signals.new_frame.emit(self.key, frame_data)
-                            
+                                # Process the complete frame
+                                self._process_frame(frame_data)
+
+                            # --- Heartbeat ---
                             elif header.upper() == "HEARTBEAT":
                                 self.last_heartbeat = time.time()
-                            
+
+                            # --- Status Message ---
                             elif header.upper().startswith("STATUS"):
                                 self.server.log(f"📊 {self.key}: {header}")
-                            
+
+                            # --- General Message ---
                             elif header.upper().startswith("MSG"):
                                 self.server.log(f"💬 {self.key}: {header}")
-                            
+
+                            # --- Backup Reception ---
+                            elif header.startswith("BACKUP_DATA:"):
+                                try:
+                                    size_str = header.split(":", 1)[1]
+                                    self.expected_backup_size = int(size_str)
+                                    self.backup_receiving = True
+                                    self.backup_buffer = buffer
+                                    buffer = b""
+                                    self.server.log(f"💾 Receiving backup ({format_bytes(self.expected_backup_size)}) from {self.key}")
+                                except Exception as e:
+                                    self.server.log(f"⚠️ Backup data header error from {self.key}: {e}")
+
+                            elif header.startswith("BACKUP_ERROR:"):
+                                error_msg = header.split(":", 1)[1]
+                                self.server.log(f"❌ Backup error from {self.key}: {error_msg}")
+
+                            elif header.startswith("INFO:"):
+                                try:
+                                    info_json = header[5:]
+                                    self.client_info = json.loads(info_json)
+                                except Exception as e:
+                                    self.server.log(f"⚠️ Failed to parse INFO from {self.key}: {e}")
+
                             else:
                                 self.server.log(f"📝 {self.key}: {header}")
-                        
-                        except ConnectionError as ce:
-                            self.server.log(f"⚠️ Connection error: {ce}")
-                            break
-                        except Exception as e:
-                            self.server.log(f"⚠️ Error processing '{header}': {e}")
-                            continue
-                
-                except socket.timeout:
-                    if time.time() - self.last_heartbeat > 60:
-                        self.server.log(f"⏱️ Client {self.key} timed out")
-                        break
-                    continue
-                
-                except (ConnectionResetError, ConnectionAbortedError):
-                    self.server.log(f"⚠️ Connection lost with {self.key}")
-                    break
-                
-                except OSError as e:
-                    consecutive_errors += 1
-                    if consecutive_errors >= max_consecutive_errors:
-                        self.server.log(f"⚠️ Too many errors from {self.key}")
-                        break
-                    time.sleep(0.1)
-        
-        except Exception as e:
-            self.server.log(f"❌ Handler error for {self.key}: {e}")
-        
-        finally:
-            self.running.clear()
-            try:
-                if self.sock:
-                    self.sock.close()
-            except:
-                pass
-            
-            self.client_info["status"] = "disconnected"
-            self.server.log(f"❌ {self.key} disconnected")
-            self.server.remove_client(self.key)
 
+                    except socket.timeout:
+                        if time.time() - self.last_heartbeat > 60:
+                            self.server.log(f"⏱️ Client {self.key} timed out")
+                            break
+                        continue
+
+                    except (ConnectionResetError, ConnectionAbortedError):
+                        self.server.log(f"⚠️ Connection lost with {self.key}")
+                        break
+
+                    except ConnectionError as ce:
+                        self.server.log(f"⚠️ Connection error: {ce}")
+                        break
+
+                    except OSError as e:
+                        consecutive_errors += 1
+                        if consecutive_errors >= max_consecutive_errors:
+                            self.server.log(f"⚠️ Too many errors from {self.key}")
+                            break
+                        time.sleep(0.1)
+
+            except Exception as e:
+                self.server.log(f"❌ Handler error for {self.key}: {e}")
+
+            finally:
+                self.running.clear()
+                try:
+                    if self.sock:
+                        self.sock.close()
+                except:
+                    pass
+
+                self.client_info["status"] = "disconnected"
+                self.server.log(f"❌ {self.key} disconnected")
+                self.server.remove_client(self.key)
+
+
+    def _process_backup_data(self):
+        try:
+            hostname = self.client_info.get("hostname", self.key.replace(":", "_"))
+            client_folder = os.path.join(BACKUP_DIR, hostname)
+
+            # Clear existing backup
+            if os.path.exists(client_folder):
+                shutil.rmtree(client_folder)
+            os.makedirs(client_folder, exist_ok=True)
+
+            # Save zip file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            zip_path = os.path.join(client_folder, f"backup_{timestamp}.zip")
+
+            with open(zip_path, 'wb') as f:
+                f.write(self.backup_buffer[:self.expected_backup_size])
+
+            # Extract zip
+            extract_folder = os.path.join(client_folder, "files")
+            os.makedirs(extract_folder, exist_ok=True)
+
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_folder)
+
+            self.server.log(f"✅ Backup received from {hostname}: {format_bytes(len(self.backup_buffer))}")
+            self.server.log(f"📁 Saved to: {client_folder}")
+
+        except Exception as e:
+            self.server.log(f"❌ Failed to process backup: {e}")
+
+    def _process_frame(self, data):
+        self.last_image = data
+        self.last_image_ts = time.time()
+        self.frames_received += 1
+        self.server.signals.new_frame.emit(self.key, data)
 
 class AdminServer:
     def __init__(self, host=LISTEN_HOST, port=LISTEN_PORT):
@@ -791,6 +1054,29 @@ class AdminServer:
                 success += 1
         
         self.log(f"📢 Broadcast '{cmd_str}' to {success}/{len(clients)} clients")
+    
+    def request_backup_from_clients(self, client_keys, source_path):
+        """Request file backup from selected clients"""
+        success_count = 0
+        with self.clients_lock:
+            for key in client_keys:
+                if key in self.clients:
+                    if self.clients[key].request_backup(source_path):
+                        success_count += 1
+        return success_count
+    
+    # NEW: Restore files to specific clients
+    def restore_to_clients(self, client_keys, restore_path):
+        """Restore backed up files to selected clients"""
+        success_count = 0
+        with self.clients_lock:
+            for key in client_keys:
+                if key in self.clients:
+                    handler = self.clients[key]
+                    hostname = handler.client_info.get("hostname", key.replace(":", "_"))
+                    if handler.send_restore(hostname, restore_path):
+                        success_count += 1
+        return success_count
     
     def start_presentation(self, target_keys):
         if self.presenting:
@@ -1104,6 +1390,23 @@ class AdminWindow(QMainWindow):
         btn_broadcast = QPushButton("📢 Broadcast Message")
         btn_broadcast.clicked.connect(self.broadcast_message)
         msg_layout.addWidget(btn_broadcast)
+        
+         # NEW: Backup/Restore buttons
+        backup_restore_layout = QHBoxLayout()
+        self.btn_backup = QPushButton("💾 Backup Files")
+        self.btn_backup.clicked.connect(self.backup_client_files)
+        self.btn_backup.setStyleSheet("background-color: #0078d4; color: white; padding: 8px;")
+        backup_restore_layout.addWidget(self.btn_backup)
+        
+        self.btn_restore = QPushButton("📥 Restore Files")
+        self.btn_restore.clicked.connect(self.restore_client_files)
+        self.btn_restore.setStyleSheet("background-color: #107c10; color: white; padding: 8px;")
+        backup_restore_layout.addWidget(self.btn_restore)
+        
+        right_layout.addLayout(backup_restore_layout)
+        
+        left_group.setLayout(left_layout)
+        # left_panel.addWidget(actions_group)
         
         right_layout.addWidget(msg_group)
         right_layout.addStretch()
@@ -1528,19 +1831,19 @@ class AdminWindow(QMainWindow):
                 QMessageBox.information(self, "Saved", f"Image saved to:\n{filename}")
     
     def save_log(self):
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Save Log",
-            f"lab_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            "Text Files (*.txt)"
-        )
-        
-        if filename:
-            try:
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(self.txt_log.toPlainText())
-                QMessageBox.information(self, "Saved", f"Log saved to:\n{filename}")
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Failed to save: {e}")
+            filename, _ = QFileDialog.getSaveFileName(
+                self, "Save Log",
+                f"lab_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+                "Text Files (*.txt)"
+            )
+            
+            if filename:
+                try:
+                    with open(filename, 'w', encoding='utf-8') as f:
+                        f.write(self.txt_log.toPlainText())
+                    QMessageBox.information(self, "Saved", f"Log saved to:\n{filename}")
+                except Exception as e:
+                    QMessageBox.warning(self, "Error", f"Failed to save: {e}")
     
     def closeEvent(self, event):
         if self.server.running.is_set():
@@ -1558,180 +1861,179 @@ class AdminWindow(QMainWindow):
         else:
             event.accept()
             
+    def backup_client_files(self):
+        """Request backup from selected clients"""
+        keys = self._get_selected_keys()
+        if not keys:
+            QMessageBox.warning(self, "No Selection", "Select one or more clients to backup")
+            return
+        
+        source_path, ok = QInputDialog.getText(
+            self, "Backup Source Path",
+            "Enter the path to backup (e.g., C:\\Users\\Student\\Documents):",
+            QLineEdit.Normal,
+            "C:\\Users\\Student\\Documents"
+        )
+        
+        if not ok or not source_path:
+            return
+        
+        reply = QMessageBox.question(
+            self, "Confirm Backup",
+            f"Request backup from {len(keys)} client(s)?\n\n"
+            f"Source: {source_path}\n"
+            f"Destination: {BACKUP_DIR}",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            success_count = self.server.request_backup_from_clients(keys, source_path)
+            QMessageBox.information(
+                self, "Backup Started",
+                f"Backup request sent to {success_count} client(s)\n\n"
+                f"Files will be saved to:\n{BACKUP_DIR}"
+            )
+    
+    def restore_client_files(self):
+        """Restore backed up files to selected clients"""
+        keys = self._get_selected_keys()
+        if not keys:
+            QMessageBox.warning(self, "No Selection", "Select one or more clients to restore")
+            return
+        
+        restore_path, ok = QInputDialog.getText(
+            self, "Restore Destination Path",
+            "Enter the path to restore files to (e.g., C:\\Users\\Student\\Documents):",
+            QLineEdit.Normal,
+            "C:\\Users\\Student\\Documents"
+        )
+        
+        if not ok or not restore_path:
+            return
+        
+        reply = QMessageBox.question(
+            self, "Confirm Restore",
+            f"Restore files to {len(keys)} client(s)?\n\n"
+            f"Destination: {restore_path}\n"
+            f"WARNING: This will overwrite existing files!",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        
+        if reply == QMessageBox.Yes:
+            success_count = self.server.restore_to_clients(keys, restore_path)
+            QMessageBox.information(
+                self, "Restore Started",
+                f"Restore initiated for {success_count} client(s)"
+            )
+    
     def _create_sync_tab(self):
-        """Create file sync management tab"""
+        """Create the file sync tab"""
         widget = QWidget()
         layout = QVBoxLayout(widget)
         
-        # Title
-        title = QLabel("Automatic File Sync from All Clients")
-        title.setFont(QFont("Segoe UI", 14, QFont.Bold))
-        title.setStyleSheet("color: #0078d4; padding: 10px;")
-        layout.addWidget(title)
+        layout.addWidget(QLabel("💾 Automatic File Synchronization"))
         
-        # Configuration
-        config_group = QGroupBox("Global Configuration")
+        # Sync configuration
+        config_group = QGroupBox("Sync Configuration")
         config_layout = QVBoxLayout(config_group)
         
-        config_layout.addWidget(QLabel("Source path to sync from ALL clients:"))
-        
         path_layout = QHBoxLayout()
-        self.sync_path_input = QLineEdit()
-        self.sync_path_input.setText("D:\\")
-        path_layout.addWidget(self.sync_path_input)
+        path_layout.addWidget(QLabel("Source Path:"))
+        self.txt_sync_path = QLineEdit()
+        self.txt_sync_path.setPlaceholderText("e.g., C:\\Users\\Student\\Documents")
+        path_layout.addWidget(self.txt_sync_path)
         
-        btn_preset = QPushButton("Preset Paths")
-        btn_preset.clicked.connect(self.show_preset_paths)
-        path_layout.addWidget(btn_preset)
-        
+        btn_browse = QPushButton("Browse...")
+        btn_browse.clicked.connect(self._browse_sync_path)
+        path_layout.addWidget(btn_browse)
         config_layout.addLayout(path_layout)
+        
+        interval_layout = QHBoxLayout()
+        interval_layout.addWidget(QLabel("Sync Interval (seconds):"))
+        self.txt_sync_interval = QLineEdit("30")
+        self.txt_sync_interval.setMaximumWidth(100)
+        interval_layout.addWidget(self.txt_sync_interval)
+        interval_layout.addStretch()
+        config_layout.addLayout(interval_layout)
         
         layout.addWidget(config_group)
         
-        # Control buttons
-        control_layout = QHBoxLayout()
+        # Sync controls
+        controls_layout = QHBoxLayout()
         
-        self.btn_start_all_sync = QPushButton("Start AUTO SYNC ALL")
-        self.btn_start_all_sync.setStyleSheet("""
-            QPushButton {
-                background-color: #28a745;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-            }
-            QPushButton:hover {
-                background-color: #218838;
-            }
-        """)
-        self.btn_start_all_sync.clicked.connect(self.start_all_sync)
-        control_layout.addWidget(self.btn_start_all_sync)
+        self.btn_start_sync = QPushButton("▶️ Start Auto Sync")
+        self.btn_start_sync.clicked.connect(self._start_sync)
+        controls_layout.addWidget(self.btn_start_sync)
         
-        self.btn_stop_all_sync = QPushButton("Stop AUTO SYNC")
-        self.btn_stop_all_sync.setStyleSheet("""
-            QPushButton {
-                background-color: #dc3545;
-                color: white;
-                font-weight: bold;
-                padding: 10px;
-            }
-            QPushButton:hover {
-                background-color: #c82333;
-            }
-        """)
-        self.btn_stop_all_sync.clicked.connect(self.stop_all_sync)
-        self.btn_stop_all_sync.setEnabled(False)
-        control_layout.addWidget(self.btn_stop_all_sync)
+        self.btn_stop_sync = QPushButton("⏹️ Stop Auto Sync")
+        self.btn_stop_sync.clicked.connect(self._stop_sync)
+        self.btn_stop_sync.setEnabled(False)
+        controls_layout.addWidget(self.btn_stop_sync)
         
-        layout.addLayout(control_layout)
+        controls_layout.addStretch()
+        layout.addLayout(controls_layout)
         
-        # Status display
-        layout.addWidget(QLabel("Sync Activity Log:"))
-        self.sync_activity_log = QTextEdit()
-        self.sync_activity_log.setReadOnly(True)
-        self.sync_activity_log.setMaximumHeight(250)
-        layout.addWidget(self.sync_activity_log)
+        # Sync status
+        self.lbl_sync_status = QLabel("Status: Not running")
+        layout.addWidget(self.lbl_sync_status)
         
-        # Status info
-        layout.addWidget(QLabel("Sync Status:"))
-        self.sync_info_label = QLabel()
-        self.sync_info_label.setStyleSheet("background-color: #2a2a2a; padding: 10px; border-radius: 5px;")
-        layout.addWidget(self.sync_info_label)
-        
-        # Open sync folder
-        btn_open_sync = QPushButton("Open Sync Folder")
-        btn_open_sync.clicked.connect(self.open_sync_folder)
-        layout.addWidget(btn_open_sync)
-        
-        layout.addStretch()
+        # Sync log
+        layout.addWidget(QLabel("Sync Activity:"))
+        self.txt_sync_log = QTextEdit()
+        self.txt_sync_log.setReadOnly(True)
+        self.txt_sync_log.setFont(QFont("Consolas", 9))
+        layout.addWidget(self.txt_sync_log)
         
         return widget
-
-
-    def show_preset_paths(self):
-        """Show preset path options"""
-        paths = ["D:\\", "C:\\Users\\Public", "C:\\Windows\\Temp", "Custom..."]
-        path, ok = QInputDialog.getItem(self, "Select Path", "Common source paths:", paths)
-        
-        if ok:
-            if path == "Custom...":
-                custom, ok = QInputDialog.getText(self, "Custom Path", "Enter path:")
-                if ok:
-                    self.sync_path_input.setText(custom)
-            else:
-                self.sync_path_input.setText(path)
-
-
-    def start_all_sync(self):
-        """Start auto-sync for ALL clients"""
-        source_path = self.sync_path_input.text()
-        
+    
+    def _browse_sync_path(self):
+        """Browse for sync source path"""
+        path = QFileDialog.getExistingDirectory(self, "Select Source Directory")
+        if path:
+            self.txt_sync_path.setText(path)
+    
+    def _start_sync(self):
+        """Start automatic file sync"""
+        source_path = self.txt_sync_path.text().strip()
         if not source_path:
-            QMessageBox.warning(self, "Error", "Please enter a source path")
+            QMessageBox.warning(self, "No Path", "Please enter a source path")
             return
         
-        if not hasattr(self, "file_sync_manager"):
-            self.file_sync_manager = FileSyncManager(self.server)
-        
-        self.file_sync_manager.set_global_source_path(source_path)
-        
-        # Ask for sync interval
-        interval, ok = QInputDialog.getInt(
-            self,
-            "Sync Interval",
-            "Sync every X seconds:",
-            30, 5, 300
-        )
-        
-        if ok:
-            self.file_sync_manager.start_sync_cycle(interval)
-            self.btn_start_all_sync.setEnabled(False)
-            self.btn_stop_all_sync.setEnabled(True)
-            
-            msg = f"AUTO SYNC STARTED\nSource path: {source_path}\nInterval: {interval}s"
-            self.server.log(f"AUTO SYNC: {msg.replace(chr(10), ' ')}")
-            QMessageBox.information(self, "Started", msg)
-
-
-    def stop_all_sync(self):
-        """Stop auto-sync"""
-        if hasattr(self, "file_sync_manager"):
-            self.file_sync_manager.stop_sync_cycle()
-            self.btn_start_all_sync.setEnabled(True)
-            self.btn_stop_all_sync.setEnabled(False)
-            QMessageBox.information(self, "Stopped", "AUTO SYNC stopped")
-
-
-    def open_sync_folder(self):
-        """Open sync folder in file explorer"""
-        if hasattr(self, "file_sync_manager"):
-            folder = self.file_sync_manager.base_sync_dir
-            try:
-                if sys.platform.startswith("win"):
-                    os.startfile(folder)
-                elif sys.platform.startswith("darwin"):
-                    os.system(f"open '{folder}'")
-                else:
-                    os.system(f"xdg-open '{folder}'")
-            except Exception as e:
-                QMessageBox.warning(self, "Error", f"Could not open folder: {e}")
-
-
-    def _update_sync_info(self):
-        """Update sync status display (call this periodically)"""
-        if not hasattr(self, "file_sync_manager"):
+        try:
+            interval = int(self.txt_sync_interval.text())
+            if interval < 5:
+                QMessageBox.warning(self, "Invalid Interval", "Interval must be at least 5 seconds")
+                return
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Interval", "Please enter a valid number")
             return
         
-        status = self.file_sync_manager.get_sync_status()
+        # Initialize sync manager if not exists
+        if not hasattr(self.server, 'sync_manager'):
+            self.server.sync_manager = FileSyncManager(self.server)
         
-        info_text = f"""
-        Sync Running: {'YES' if status['running'] else 'NO'}
-        Clients Syncing: {status['clients_syncing']}
-        Total Files Collected: {status['total_files']}
-        Storage: {status['sync_dir']}
-        """
+        self.server.sync_manager.set_global_source_path(source_path)
+        self.server.sync_manager.start_sync_cycle(interval)
         
-        self.sync_info_label.setText(info_text)
-
+        self.btn_start_sync.setEnabled(False)
+        self.btn_stop_sync.setEnabled(True)
+        self.lbl_sync_status.setText(f"Status: Running (syncing every {interval}s)")
+        self.lbl_sync_status.setStyleSheet("color: #4EC9B0;")
+    
+    def _stop_sync(self):
+        """Stop automatic file sync"""
+        if hasattr(self.server, 'sync_manager'):
+            self.server.sync_manager.stop_sync_cycle()
+        
+        self.btn_start_sync.setEnabled(True)
+        self.btn_stop_sync.setEnabled(False)
+        self.lbl_sync_status.setText("Status: Not running")
+        self.lbl_sync_status.setStyleSheet("color: #e0e0e0;")
+    
+    def closeEvent(self, event):
+        if hasattr(self.server, 'sync_manager'):
+            self.server.sync_manager.stop_sync_cycle()
+        event.accept()
 
 def main():
     app = QApplication(sys.argv)
