@@ -352,238 +352,238 @@ class ClientHandler:
             self.server.log(f"❌ Send error to {self.key}: {e}")
             return False
     
-    def send_file_resumable(self, filepath, destination=None):
-        if not os.path.exists(filepath):
-            self.server.log(f"❌ File not found: {filepath}")
-            return False
+    # def send_file_resumable(self, filepath, destination=None):
+    #     if not os.path.exists(filepath):
+    #         self.server.log(f"❌ File not found: {filepath}")
+    #         return False
         
-        if not self.sock or not self.running.is_set():
-            self.server.log(f"⚠️ Client {self.key} not connected")
-            return False
+    #     if not self.sock or not self.running.is_set():
+    #         self.server.log(f"⚠️ Client {self.key} not connected")
+    #         return False
         
-        self.transferring.set()
+    #     self.transferring.set()
         
-        try:
-            transfer = ResumableFileTransfer(filepath, destination or "Downloads")
-            basename = transfer.basename
-            filesize = transfer.filesize
-            chunk_size = transfer.chunk_size
+    #     try:
+    #         transfer = ResumableFileTransfer(filepath, destination or "Downloads")
+    #         basename = transfer.basename
+    #         filesize = transfer.filesize
+    #         chunk_size = transfer.chunk_size
             
-            self.server.log(f"📤 Starting: {basename} ({format_bytes(filesize)})")
+    #         self.server.log(f"📤 Starting: {basename} ({format_bytes(filesize)})")
             
-            pending_chunks = transfer.get_pending_chunks()
-            if len(pending_chunks) < transfer.total_chunks:
-                self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} done")
+    #         pending_chunks = transfer.get_pending_chunks()
+    #         if len(pending_chunks) < transfer.total_chunks:
+    #             self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} done")
             
-            try:
-                self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
-                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECV_BUFFER)
-            except:
-                pass
+    #         try:
+    #             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    #             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
+    #             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECV_BUFFER)
+    #         except:
+    #             pass
             
-            init_header = {
-                "command": "RESUMABLE_TRANSFER_START",
-                "transfer_id": transfer.transfer_id,
-                "filename": basename,
-                "destination": transfer.destination,
-                "filesize": filesize,
-                "total_chunks": transfer.total_chunks,
-                "chunk_size": chunk_size,
-                "batch_ack_size": BATCH_ACK_SIZE
-            }
+    #         init_header = {
+    #             "command": "RESUMABLE_TRANSFER_START",
+    #             "transfer_id": transfer.transfer_id,
+    #             "filename": basename,
+    #             "destination": transfer.destination,
+    #             "filesize": filesize,
+    #             "total_chunks": transfer.total_chunks,
+    #             "chunk_size": chunk_size,
+    #             "batch_ack_size": BATCH_ACK_SIZE
+    #         }
             
-            init_json = json.dumps(init_header).encode("utf-8")
-            header = b"RESUMABLE_FILE\n" + struct.pack(">I", len(init_json)) + init_json
+    #         init_json = json.dumps(init_header).encode("utf-8")
+    #         header = b"RESUMABLE_FILE\n" + struct.pack(">I", len(init_json)) + init_json
             
-            with self.lock:
-                try:
-                    self.sock.sendall(header)
-                except OSError:
-                    self.server.log(f"❌ Cannot start transfer")
-                    return False
+    #         with self.lock:
+    #             try:
+    #                 self.sock.sendall(header)
+    #             except OSError:
+    #                 self.server.log(f"❌ Cannot start transfer")
+    #                 return False
                 
-                self.sock.settimeout(15.0)
-                buffer = b""
-                ready_received = False
-                start_wait = time.time()
+    #             self.sock.settimeout(15.0)
+    #             buffer = b""
+    #             ready_received = False
+    #             start_wait = time.time()
                 
-                while not ready_received and (time.time() - start_wait) < 15:
-                    try:
-                        chunk = self.sock.recv(1024)
-                    except socket.timeout:
-                        continue
-                    except OSError:
-                        self.server.log(f"⚠️ Socket closed waiting for READY")
-                        return False
+    #             while not ready_received and (time.time() - start_wait) < 15:
+    #                 try:
+    #                     chunk = self.sock.recv(1024)
+    #                 except socket.timeout:
+    #                     continue
+    #                 except OSError:
+    #                     self.server.log(f"⚠️ Socket closed waiting for READY")
+    #                     return False
                     
-                    if not chunk:
-                        raise Exception("Connection closed waiting for READY")
+    #                 if not chunk:
+    #                     raise Exception("Connection closed waiting for READY")
                     
-                    buffer += chunk
-                    while b'\n' in buffer:
-                        line, buffer = buffer.split(b'\n', 1)
-                        msg = line.decode('utf-8', errors='ignore').strip()
+    #                 buffer += chunk
+    #                 while b'\n' in buffer:
+    #                     line, buffer = buffer.split(b'\n', 1)
+    #                     msg = line.decode('utf-8', errors='ignore').strip()
                         
-                        if msg == "READY":
-                            ready_received = True
-                            break
-                        elif msg == "HEARTBEAT":
-                            continue
-                        elif msg == "ERROR":
-                            raise Exception("Client error during handshake")
+    #                     if msg == "READY":
+    #                         ready_received = True
+    #                         break
+    #                     elif msg == "HEARTBEAT":
+    #                         continue
+    #                     elif msg == "ERROR":
+    #                         raise Exception("Client error during handshake")
                 
-                if not ready_received:
-                    raise Exception("Timeout waiting for READY")
+    #             if not ready_received:
+    #                 raise Exception("Timeout waiting for READY")
                 
-                self.server.log("✅ Client READY - Starting transfer")
-                self.sock.settimeout(None)
+    #             self.server.log("✅ Client READY - Starting transfer")
+    #             self.sock.settimeout(None)
                 
-                start_time = time.time()
-                sent_bytes = 0
-                last_log = start_time
-                chunks_in_batch = []
-                chunk_delay = CHUNK_SEND_DELAY
+    #             start_time = time.time()
+    #             sent_bytes = 0
+    #             last_log = start_time
+    #             chunks_in_batch = []
+    #             chunk_delay = CHUNK_SEND_DELAY
                 
-                with open(filepath, "rb") as f:
-                    for idx, chunk_index in enumerate(pending_chunks):
-                        if not self.running.is_set():
-                            self.server.log(f"⚠️ Transfer stopped")
-                            break
+    #             with open(filepath, "rb") as f:
+    #                 for idx, chunk_index in enumerate(pending_chunks):
+    #                     if not self.running.is_set():
+    #                         self.server.log(f"⚠️ Transfer stopped")
+    #                         break
                         
-                        try:
-                            f.seek(chunk_index * chunk_size)
-                            chunk_data = f.read(chunk_size)
-                            if not chunk_data:
-                                break
+    #                     try:
+    #                         f.seek(chunk_index * chunk_size)
+    #                         chunk_data = f.read(chunk_size)
+    #                         if not chunk_data:
+    #                             break
                             
-                            checksum = transfer._calculate_chunk_checksum(chunk_data)
-                            chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
-                            chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
+    #                         checksum = transfer._calculate_chunk_checksum(chunk_data)
+    #                         chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
+    #                         chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
                             
-                            try:
-                                self.sock.sendall(chunk_header + chunk_data)
-                            except OSError:
-                                self.server.log(f"⚠️ Socket closed during chunk {chunk_index}")
-                                transfer.save_progress_batch()
-                                return False
+    #                         try:
+    #                             self.sock.sendall(chunk_header + chunk_data)
+    #                         except OSError:
+    #                             self.server.log(f"⚠️ Socket closed during chunk {chunk_index}")
+    #                             transfer.save_progress_batch()
+    #                             return False
                             
-                            time.sleep(chunk_delay)
-                            sent_bytes += len(chunk_data)
-                            chunks_in_batch.append((chunk_index, checksum))
+    #                         time.sleep(chunk_delay)
+    #                         sent_bytes += len(chunk_data)
+    #                         chunks_in_batch.append((chunk_index, checksum))
                             
-                            if len(chunks_in_batch) >= BATCH_ACK_SIZE or idx == len(pending_chunks) - 1:
-                                self.sock.settimeout(30.0)
-                                ack_buffer = b""
-                                ack_received = False
-                                ack_start = time.time()
+    #                         if len(chunks_in_batch) >= BATCH_ACK_SIZE or idx == len(pending_chunks) - 1:
+    #                             self.sock.settimeout(30.0)
+    #                             ack_buffer = b""
+    #                             ack_received = False
+    #                             ack_start = time.time()
                                 
-                                while not ack_received and (time.time() - ack_start) < 30:
-                                    try:
-                                        chunk_ack = self.sock.recv(4096)
-                                    except socket.timeout:
-                                        continue
-                                    except OSError:
-                                        self.server.log(f"⚠️ Socket closed waiting for ACK")
-                                        transfer.save_progress_batch()
-                                        return False
+    #                             while not ack_received and (time.time() - ack_start) < 30:
+    #                                 try:
+    #                                     chunk_ack = self.sock.recv(4096)
+    #                                 except socket.timeout:
+    #                                     continue
+    #                                 except OSError:
+    #                                     self.server.log(f"⚠️ Socket closed waiting for ACK")
+    #                                     transfer.save_progress_batch()
+    #                                     return False
                                     
-                                    if not chunk_ack:
-                                        raise Exception("Connection closed during ACK")
+    #                                 if not chunk_ack:
+    #                                     raise Exception("Connection closed during ACK")
                                     
-                                    ack_buffer += chunk_ack
-                                    while b'\n' in ack_buffer:
-                                        line, ack_buffer = ack_buffer.split(b'\n', 1)
-                                        msg = line.decode('utf-8', errors='ignore').strip().upper()
+    #                                 ack_buffer += chunk_ack
+    #                                 while b'\n' in ack_buffer:
+    #                                     line, ack_buffer = ack_buffer.split(b'\n', 1)
+    #                                     msg = line.decode('utf-8', errors='ignore').strip().upper()
                                         
-                                        if msg == "CHUNK_OK":
-                                            ack_received = True
-                                            break
-                                        elif msg == "HEARTBEAT":
-                                            continue
-                                        elif msg in ["CHUNK_ERROR", "ERROR"]:
-                                            raise Exception(f"Client error at chunk {chunk_index}")
+    #                                     if msg == "CHUNK_OK":
+    #                                         ack_received = True
+    #                                         break
+    #                                     elif msg == "HEARTBEAT":
+    #                                         continue
+    #                                     elif msg in ["CHUNK_ERROR", "ERROR"]:
+    #                                         raise Exception(f"Client error at chunk {chunk_index}")
                                 
-                                if not ack_received:
-                                    raise Exception(f"Timeout waiting for ACK at chunk {chunk_index}")
+    #                             if not ack_received:
+    #                                 raise Exception(f"Timeout waiting for ACK at chunk {chunk_index}")
                                 
-                                self.sock.settimeout(None)
+    #                             self.sock.settimeout(None)
                                 
-                                for ci, cs in chunks_in_batch:
-                                    transfer.mark_chunk_complete(ci, cs)
-                                chunks_in_batch = []
-                                if idx % 50 == 0:
-                                    transfer.save_progress_batch()
+    #                             for ci, cs in chunks_in_batch:
+    #                                 transfer.mark_chunk_complete(ci, cs)
+    #                             chunks_in_batch = []
+    #                             if idx % 50 == 0:
+    #                                 transfer.save_progress_batch()
                             
-                            current_time = time.time()
-                            if current_time - last_log >= 2.0:
-                                progress = transfer.get_progress()
-                                elapsed = current_time - start_time
-                                speed = sent_bytes / elapsed if elapsed > 0 else 0
-                                eta = ((filesize - sent_bytes) / speed) if speed > 0 else 0
-                                self.server.log(
-                                    f"📊 {progress:.1f}% | {format_bytes(speed)}/s | "
-                                    f"ETA: {int(eta)}s"
-                                )
-                                last_log = current_time
-                                sent_bytes = 0
+    #                         current_time = time.time()
+    #                         if current_time - last_log >= 2.0:
+    #                             progress = transfer.get_progress()
+    #                             elapsed = current_time - start_time
+    #                             speed = sent_bytes / elapsed if elapsed > 0 else 0
+    #                             eta = ((filesize - sent_bytes) / speed) if speed > 0 else 0
+    #                             self.server.log(
+    #                                 f"📊 {progress:.1f}% | {format_bytes(speed)}/s | "
+    #                                 f"ETA: {int(eta)}s"
+    #                             )
+    #                             last_log = current_time
+    #                             sent_bytes = 0
                         
-                        except Exception as e:
-                            self.server.log(f"❌ Chunk {chunk_index} error: {e}")
-                            raise
+    #                     except Exception as e:
+    #                         self.server.log(f"❌ Chunk {chunk_index} error: {e}")
+    #                         raise
                 
-                try:
-                    self.sock.sendall(b"TRANSFER_COMPLETE\n")
-                    self.server.log("✅ All chunks sent, waiting for VERIFIED")
-                except OSError:
-                    self.server.log(f"⚠️ Socket closed before TRANSFER_COMPLETE")
-                    transfer.save_progress_batch()
-                    return False
+    #             try:
+    #                 self.sock.sendall(b"TRANSFER_COMPLETE\n")
+    #                 self.server.log("✅ All chunks sent, waiting for VERIFIED")
+    #             except OSError:
+    #                 self.server.log(f"⚠️ Socket closed before TRANSFER_COMPLETE")
+    #                 transfer.save_progress_batch()
+    #                 return False
                 
-                self.sock.settimeout(60.0)
-                try:
-                    verify_buffer = b""
-                    verify_start = time.time()
+    #             self.sock.settimeout(60.0)
+    #             try:
+    #                 verify_buffer = b""
+    #                 verify_start = time.time()
                     
-                    while (time.time() - verify_start) < 60:
-                        try:
-                            final_ack = self.sock.recv(4096)
-                            if not final_ack:
-                                raise ConnectionError("Connection closed waiting for VERIFIED")
+    #                 while (time.time() - verify_start) < 60:
+    #                     try:
+    #                         final_ack = self.sock.recv(4096)
+    #                         if not final_ack:
+    #                             raise ConnectionError("Connection closed waiting for VERIFIED")
                             
-                            verify_buffer += final_ack
+    #                         verify_buffer += final_ack
                             
-                            if b"VERIFIED" in verify_buffer:
-                                self.server.log("✅ Client verified transfer")
-                                break
-                            elif b"HEARTBEAT" in verify_buffer:
-                                verify_buffer = b""
-                                continue
+    #                         if b"VERIFIED" in verify_buffer:
+    #                             self.server.log("✅ Client verified transfer")
+    #                             break
+    #                         elif b"HEARTBEAT" in verify_buffer:
+    #                             verify_buffer = b""
+    #                             continue
                         
-                        except socket.timeout:
-                            continue
-                    else:
-                        self.server.log("⚠️ Timeout waiting for VERIFIED")
+    #                     except socket.timeout:
+    #                         continue
+    #                 else:
+    #                     self.server.log("⚠️ Timeout waiting for VERIFIED")
                 
-                except OSError:
-                    self.server.log("⚠️ Socket closed before VERIFIED")
-                finally:
-                    self.sock.settimeout(None)
+    #             except OSError:
+    #                 self.server.log("⚠️ Socket closed before VERIFIED")
+    #             finally:
+    #                 self.sock.settimeout(None)
             
-            elapsed = time.time() - start_time
-            speed = filesize / elapsed if elapsed > 0 else 0
-            self.server.log(f"✅ Complete: {basename} | {format_bytes(speed)}/s | {int(elapsed)}s")
+    #         elapsed = time.time() - start_time
+    #         speed = filesize / elapsed if elapsed > 0 else 0
+    #         self.server.log(f"✅ Complete: {basename} | {format_bytes(speed)}/s | {int(elapsed)}s")
             
-            transfer.cleanup()
-            return True
+    #         transfer.cleanup()
+    #         return True
         
-        except Exception as e:
-            self.server.log(f"❌ Transfer error: {e}")
-            self.server.log("💾 Progress saved - can resume")
-            return False
+    #     except Exception as e:
+    #         self.server.log(f"❌ Transfer error: {e}")
+    #         self.server.log("💾 Progress saved - can resume")
+    #         return False
         
-        finally:
-            self.transferring.clear()
+    #     finally:
+    #         self.transferring.clear()
             
             
     # NEW: Request backup from client
@@ -634,6 +634,7 @@ class ClientHandler:
             return False
     
     def send_file_resumable(self, filepath, destination=None):
+        """FIXED: Unified resumable file transfer with proper protocol"""
         if not os.path.exists(filepath):
             self.server.log(f"❌ File not found: {filepath}")
             return False
@@ -656,6 +657,7 @@ class ClientHandler:
             if len(pending_chunks) < transfer.total_chunks:
                 self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} done")
             
+            # Configure socket
             try:
                 self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
@@ -663,6 +665,7 @@ class ClientHandler:
             except:
                 pass
             
+            # Prepare transfer header
             init_header = {
                 "command": "RESUMABLE_TRANSFER_START",
                 "transfer_id": transfer.transfer_id,
@@ -670,91 +673,212 @@ class ClientHandler:
                 "destination": transfer.destination,
                 "filesize": filesize,
                 "total_chunks": transfer.total_chunks,
-                "chunk_size": chunk_size
+                "chunk_size": chunk_size,
+                "batch_ack_size": BATCH_ACK_SIZE
             }
             
-            init_json = json.dumps(init_header)
-            init_data = init_json.encode("utf-8")
-            size_bytes = struct.pack(">Q", len(init_data))
+            init_json = json.dumps(init_header).encode("utf-8")
+            header = b"RESUMABLE_FILE\n" + struct.pack(">I", len(init_json)) + init_json
             
             with self.lock:
-                self.sock.sendall(b"INIT\n" + size_bytes + init_data)
-            
-            time.sleep(0.2)
-            
-            self.server.log(f"📦 Sending {len(pending_chunks)} chunks...")
-            
-            with open(filepath, 'rb') as f:
-                chunks_sent = 0
-                start_time = time.time()
-                last_log = start_time
+                try:
+                    self.sock.sendall(header)
+                except OSError:
+                    self.server.log(f"❌ Cannot start transfer")
+                    return False
                 
-                for chunk_index in pending_chunks:
-                    offset = chunk_index * chunk_size
-                    f.seek(offset)
-                    chunk_data = f.read(chunk_size)
-                    
-                    if not chunk_data:
-                        break
-                    
-                    checksum = transfer._calculate_chunk_checksum(chunk_data)
-                    chunk_header = struct.pack(">QQ", chunk_index, len(chunk_data))
-                    
-                    with self.lock:
-                        self.sock.sendall(b"CHUNK\n" + chunk_header + chunk_data)
-                    
-                    chunks_sent += 1
-                    
-                    if chunks_sent % BATCH_ACK_SIZE == 0:
-                        try:
-                            ack = self.sock.recv(1024)
-                            if b"CHUNK_OK" in ack:
-                                for i in range(chunks_sent - BATCH_ACK_SIZE, chunks_sent):
-                                    idx = pending_chunks[i] if i < len(pending_chunks) else chunk_index
-                                    transfer.mark_chunk_complete(idx, checksum)
-                                transfer.save_progress_batch()
-                        except:
-                            pass
-                    
-                    current_time = time.time()
-                    if current_time - last_log >= 2.0:
-                        elapsed = current_time - start_time
-                        speed = (chunks_sent * chunk_size) / elapsed if elapsed > 0 else 0
-                        progress = (chunks_sent / len(pending_chunks)) * 100
-                        self.server.log(f"📊 Progress: {progress:.1f}% ({format_bytes(speed)}/s)")
-                        last_log = current_time
-                    
-                    time.sleep(CHUNK_SEND_DELAY)
+                # Wait for READY confirmation
+                self.sock.settimeout(15.0)
+                buffer = b""
+                ready_received = False
+                start_wait = time.time()
                 
-                remaining = chunks_sent % BATCH_ACK_SIZE
-                if remaining > 0:
+                while not ready_received and (time.time() - start_wait) < 15:
                     try:
-                        self.sock.sendall(b"CHUNK_OK\n")
-                        time.sleep(0.1)
-                    except:
-                        pass
+                        chunk = self.sock.recv(1024)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        self.server.log(f"⚠️ Socket closed waiting for READY")
+                        return False
+                    
+                    if not chunk:
+                        raise Exception("Connection closed waiting for READY")
+                    
+                    buffer += chunk
+                    while b'\n' in buffer:
+                        line, buffer = buffer.split(b'\n', 1)
+                        msg = line.decode('utf-8', errors='ignore').strip()
+                        
+                        if msg == "READY":
+                            ready_received = True
+                            break
+                        elif msg == "HEARTBEAT":
+                            continue
+                        elif msg == "ERROR":
+                            raise Exception("Client error during handshake")
+                
+                if not ready_received:
+                    raise Exception("Timeout waiting for READY")
+                
+                self.server.log("✅ Client READY - Starting transfer")
+                self.sock.settimeout(None)
+                
+                # Transfer chunks
+                start_time = time.time()
+                sent_bytes = 0
+                last_log = start_time
+                chunks_in_batch = []
+                chunk_delay = CHUNK_SEND_DELAY
+                
+                with open(filepath, "rb") as f:
+                    for idx, chunk_index in enumerate(pending_chunks):
+                        if not self.running.is_set():
+                            self.server.log(f"⚠️ Transfer stopped")
+                            break
+                        
+                        try:
+                            # Read chunk
+                            f.seek(chunk_index * chunk_size)
+                            chunk_data = f.read(chunk_size)
+                            if not chunk_data:
+                                break
+                            
+                            # Calculate checksum
+                            checksum = transfer._calculate_chunk_checksum(chunk_data)
+                            
+                            # Prepare chunk header (index + size + checksum)
+                            chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
+                            chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
+                            
+                            # Send chunk
+                            try:
+                                self.sock.sendall(chunk_header + chunk_data)
+                            except OSError:
+                                self.server.log(f"⚠️ Socket closed during chunk {chunk_index}")
+                                transfer.save_progress_batch()
+                                return False
+                            
+                            time.sleep(chunk_delay)
+                            sent_bytes += len(chunk_data)
+                            chunks_in_batch.append((chunk_index, checksum))
+                            
+                            # Wait for batch acknowledgment
+                            if len(chunks_in_batch) >= BATCH_ACK_SIZE or idx == len(pending_chunks) - 1:
+                                self.sock.settimeout(30.0)
+                                ack_buffer = b""
+                                ack_received = False
+                                ack_start = time.time()
+                                
+                                while not ack_received and (time.time() - ack_start) < 30:
+                                    try:
+                                        chunk_ack = self.sock.recv(4096)
+                                    except socket.timeout:
+                                        continue
+                                    except OSError:
+                                        self.server.log(f"⚠️ Socket closed waiting for ACK")
+                                        transfer.save_progress_batch()
+                                        return False
+                                    
+                                    if not chunk_ack:
+                                        raise Exception("Connection closed during ACK")
+                                    
+                                    ack_buffer += chunk_ack
+                                    while b'\n' in ack_buffer:
+                                        line, ack_buffer = ack_buffer.split(b'\n', 1)
+                                        msg = line.decode('utf-8', errors='ignore').strip().upper()
+                                        
+                                        if msg == "CHUNK_OK":
+                                            ack_received = True
+                                            break
+                                        elif msg == "HEARTBEAT":
+                                            continue
+                                        elif msg in ["CHUNK_ERROR", "ERROR"]:
+                                            raise Exception(f"Client error at chunk {chunk_index}")
+                                
+                                if not ack_received:
+                                    raise Exception(f"Timeout waiting for ACK at chunk {chunk_index}")
+                                
+                                self.sock.settimeout(None)
+                                
+                                # Mark chunks as complete
+                                for ci, cs in chunks_in_batch:
+                                    transfer.mark_chunk_complete(ci, cs)
+                                chunks_in_batch = []
+                                
+                                # Save progress periodically
+                                if idx % 50 == 0:
+                                    transfer.save_progress_batch()
+                            
+                            # Log progress
+                            current_time = time.time()
+                            if current_time - last_log >= 2.0:
+                                progress = transfer.get_progress()
+                                elapsed = current_time - start_time
+                                speed = sent_bytes / elapsed if elapsed > 0 else 0
+                                eta = ((filesize - (len(transfer.completed_chunks) * chunk_size)) / speed) if speed > 0 else 0
+                                self.server.log(
+                                    f"📊 {progress:.1f}% | {format_bytes(speed)}/s | "
+                                    f"ETA: {int(eta)}s"
+                                )
+                                last_log = current_time
+                                sent_bytes = 0
+                        
+                        except Exception as e:
+                            self.server.log(f"❌ Chunk {chunk_index} error: {e}")
+                            raise
+                
+                # Send completion signal
+                try:
+                    self.sock.sendall(b"TRANSFER_COMPLETE\n")
+                    self.server.log("✅ All chunks sent, waiting for VERIFIED")
+                except OSError:
+                    self.server.log(f"⚠️ Socket closed before TRANSFER_COMPLETE")
+                    transfer.save_progress_batch()
+                    return False
+                
+                # Wait for verification
+                self.sock.settimeout(60.0)
+                try:
+                    verify_buffer = b""
+                    verify_start = time.time()
+                    
+                    while (time.time() - verify_start) < 60:
+                        try:
+                            final_ack = self.sock.recv(4096)
+                            if not final_ack:
+                                raise ConnectionError("Connection closed waiting for VERIFIED")
+                            
+                            verify_buffer += final_ack
+                            
+                            if b"VERIFIED" in verify_buffer:
+                                self.server.log("✅ Client verified transfer")
+                                break
+                            elif b"HEARTBEAT" in verify_buffer:
+                                verify_buffer = b""
+                                continue
+                        
+                        except socket.timeout:
+                            continue
+                    else:
+                        self.server.log("⚠️ Timeout waiting for VERIFIED")
+                
+                except OSError:
+                    self.server.log("⚠️ Socket closed before VERIFIED")
+                finally:
+                    self.sock.settimeout(None)
             
-            with self.lock:
-                self.sock.sendall(b"TRANSFER_COMPLETE\n")
+            # Success
+            elapsed = time.time() - start_time
+            speed = filesize / elapsed if elapsed > 0 else 0
+            self.server.log(f"✅ Complete: {basename} | {format_bytes(speed)}/s | {int(elapsed)}s")
             
-            time.sleep(0.5)
-            
-            try:
-                response = self.sock.recv(1024)
-                if b"VERIFIED" in response:
-                    transfer.cleanup()
-                    elapsed = time.time() - start_time
-                    speed = filesize / elapsed if elapsed > 0 else 0
-                    self.server.log(f"✅ Transfer complete: {basename} ({format_bytes(speed)}/s)")
-                    return True
-            except:
-                pass
-            
-            self.server.log(f"⚠️ Transfer may be incomplete")
-            return False
+            transfer.cleanup()
+            return True
         
         except Exception as e:
             self.server.log(f"❌ Transfer error: {e}")
+            self.server.log("💾 Progress saved - can resume")
             return False
         
         finally:
@@ -1410,9 +1534,9 @@ class AdminWindow(QMainWindow):
         monitor_group = QGroupBox("📺 Screen Monitoring")
         monitor_layout = QVBoxLayout(monitor_group)
         
-        btn_screenshot = QPushButton("📸 Request Screenshot")
-        btn_screenshot.clicked.connect(lambda: self.send_to_selected("REQUEST_SCREEN"))
-        monitor_layout.addWidget(btn_screenshot)
+        # btn_screenshot = QPushButton("📸 Request Screenshot")
+        # btn_screenshot.clicked.connect(lambda: self.send_to_selected("REQUEST_SCREEN"))
+        # monitor_layout.addWidget(btn_screenshot)
         
         btn_start_stream = QPushButton("▶️ Start Live View")
         btn_start_stream.clicked.connect(lambda: self.send_to_selected("START_SCREEN_STREAM"))
