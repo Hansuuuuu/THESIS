@@ -873,6 +873,31 @@ class ClientHandler:
                                 try:
                                     info_json = header[5:]
                                     self.client_info = json.loads(info_json)
+                                    
+                                    # NEW: Check for duplicate hostnames
+                                    hostname = self.client_info.get("hostname", "Unknown")
+                                    duplicate_found = False
+                                    duplicate_keys = []
+                                    
+                                    with self.server.clients_lock:
+                                        for other_key, other_handler in self.server.clients.items():
+                                            if other_key != self.key:
+                                                other_hostname = other_handler.client_info.get("hostname", "")
+                                                if other_hostname == hostname:
+                                                    duplicate_found = True
+                                                    duplicate_keys.append(other_key)
+                                    
+                                    if duplicate_found:
+                                        self.server.log(
+                                            f"⚠️ WARNING: Duplicate PC name detected!\n"
+                                            f"   PC Name: '{hostname}'\n"
+                                            f"   New client: {self.key}\n"
+                                            f"   Existing: {', '.join(duplicate_keys)}\n"
+                                            f"   Both clients remain connected but backups may conflict!"
+                                        )
+                                    else:
+                                        self.server.log(f"📋 Client identified: {hostname} ({self.key})")
+                                    
                                 except Exception as e:
                                     self.server.log(f"⚠️ Failed to parse INFO from {self.key}: {e}")
 
@@ -919,9 +944,12 @@ class ClientHandler:
     def _process_backup_data(self):
         try:
             hostname = self.client_info.get("hostname", self.key.replace(":", "_"))
-            client_folder = os.path.join(BACKUP_DIR, hostname)
+            
+            # Use custom backup directory if set
+            backup_dir = getattr(self.server, 'custom_backup_dir', BACKUP_DIR)
+            client_folder = os.path.join(backup_dir, hostname)
 
-            # Clear existing backup
+            # Clear existing backup in this folder
             if os.path.exists(client_folder):
                 shutil.rmtree(client_folder)
             os.makedirs(client_folder, exist_ok=True)
@@ -930,21 +958,50 @@ class ClientHandler:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             zip_path = os.path.join(client_folder, f"backup_{timestamp}.zip")
 
+            # Track progress
+            total_size = self.expected_backup_size
+            bytes_written = 0
+            
+            self.server.log(f"💾 Saving backup from {hostname} ({format_bytes(total_size)})...")
+            
             with open(zip_path, 'wb') as f:
-                f.write(self.backup_buffer[:self.expected_backup_size])
+                chunk_size = 1024 * 1024  # 1MB chunks
+                buffer_data = self.backup_buffer[:self.expected_backup_size]
+                
+                for i in range(0, len(buffer_data), chunk_size):
+                    chunk = buffer_data[i:i+chunk_size]
+                    f.write(chunk)
+                    bytes_written += len(chunk)
+                    
+                    # Log progress every 20%
+                    progress = int((bytes_written / total_size) * 100)
+                    if progress > 0 and progress % 20 == 0:
+                        self.server.log(f"📊 Saving {hostname}: {progress}% ({format_bytes(bytes_written)}/{format_bytes(total_size)})")
 
             # Extract zip
             extract_folder = os.path.join(client_folder, "files")
             os.makedirs(extract_folder, exist_ok=True)
 
+            self.server.log(f"📦 Extracting backup from {hostname}...")
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_folder)
+                file_list = zip_ref.namelist()
+                total_files = len(file_list)
+                
+                for idx, file in enumerate(file_list):
+                    zip_ref.extract(file, extract_folder)
+                    
+                    # Log progress every 100 files or at completion
+                    if (idx + 1) % 100 == 0 or (idx + 1) == total_files:
+                        progress = int(((idx + 1) / total_files) * 100)
+                        self.server.log(f"📂 Extracting: {progress}% ({idx + 1}/{total_files} files)")
 
-            self.server.log(f"✅ Backup received from {hostname}: {format_bytes(len(self.backup_buffer))}")
+            self.server.log(f"✅ Backup received from {hostname}: {total_files} files ({format_bytes(len(self.backup_buffer))})")
             self.server.log(f"📁 Saved to: {client_folder}")
 
         except Exception as e:
             self.server.log(f"❌ Failed to process backup: {e}")
+            import traceback
+            self.server.log(traceback.format_exc())
 
     def _process_frame(self, data):
         self.last_image = data
@@ -1593,24 +1650,66 @@ class AdminWindow(QMainWindow):
     
     def refresh_clients(self):
         keys = self.server.list_clients()
-        selected = set([it.text().replace("💻 ", "") for it in self.lst_clients.selectedItems()])
+        selected = set([it.data(Qt.UserRole) for it in self.lst_clients.selectedItems() if it.data(Qt.UserRole)])
         
-        current_keys = set([self.lst_clients.item(i).text().replace("💻 ", "") 
+        # Get current keys
+        current_keys = set([self.lst_clients.item(i).data(Qt.UserRole) 
                            for i in range(self.lst_clients.count())])
         
         if current_keys == set(keys):
             return
         
+        # Build hostname map and detect duplicates
+        hostname_map = {}
+        duplicate_hostnames = set()
+        
+        with self.server.clients_lock:
+            for k in keys:
+                if k in self.server.clients:
+                    handler = self.server.clients[k]
+                    hostname = handler.client_info.get("hostname", k.split(":")[0])
+                    
+                    if hostname in hostname_map:
+                        duplicate_hostnames.add(hostname)
+                    else:
+                        hostname_map[hostname] = []
+                    hostname_map[hostname].append(k)
+        
+        # Alert if duplicates found
+        if duplicate_hostnames:
+            dup_list = "\n".join([f"  • {h} ({len(hostname_map[h])} clients)" for h in duplicate_hostnames])
+            self.server.log(f"⚠️ WARNING: Duplicate PC names detected:\n{dup_list}")
+        
         self.lst_clients.clear()
         for k in keys:
             from PyQt5.QtWidgets import QListWidgetItem
-            item = QListWidgetItem(f"💻 {k}")
+            
+            # Get hostname
+            hostname = k.split(":")[0]  # Default to IP
+            with self.server.clients_lock:
+                if k in self.server.clients:
+                    handler = self.server.clients[k]
+                    hostname = handler.client_info.get("hostname", hostname)
+            
+            # Check if this hostname is duplicated
+            is_duplicate = hostname in duplicate_hostnames
+            
+            # Format display text
+            if is_duplicate:
+                display_text = f"⚠️ {hostname} ({k.split(':')[0]})"  # Show warning and IP
+            else:
+                display_text = f"💻 {hostname} ({k.split(':')[0]})"  # Show hostname and IP
+            
+            item = QListWidgetItem(display_text)
+            item.setData(Qt.UserRole, k)  # Store actual key for reference
+            
             if k in selected:
                 item.setSelected(True)
+            
             self.lst_clients.addItem(item)
     
     def _get_selected_keys(self):
-        return [it.text().replace("💻 ", "") for it in self.lst_clients.selectedItems()]
+        return [it.data(Qt.UserRole) for it in self.lst_clients.selectedItems()]
     
     def send_to_selected(self, command):
         keys = self._get_selected_keys()
@@ -1862,15 +1961,16 @@ class AdminWindow(QMainWindow):
             event.accept()
             
     def backup_client_files(self):
-        """Request backup from selected clients"""
+        """Request backup from selected clients with file picker UI"""
         keys = self._get_selected_keys()
         if not keys:
             QMessageBox.warning(self, "No Selection", "Select one or more clients to backup")
             return
         
+        # Show dialog to choose source path
         source_path, ok = QInputDialog.getText(
             self, "Backup Source Path",
-            "Enter the path to backup (e.g., C:\\Users\\Student\\Documents):",
+            "Enter the path to backup on the client(s):\n(e.g., C:\\Users\\Student\\Documents)",
             QLineEdit.Normal,
             "C:\\Users\\Student\\Documents"
         )
@@ -1878,21 +1978,47 @@ class AdminWindow(QMainWindow):
         if not ok or not source_path:
             return
         
+        # Allow admin to choose backup destination with file browser
+        backup_dest = QFileDialog.getExistingDirectory(
+            self,
+            "Select Backup Destination Folder",
+            BACKUP_DIR,
+            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
+        )
+        
+        # If no directory selected, use default
+        if not backup_dest:
+            backup_dest = BACKUP_DIR
+        
+        # Create timestamped subfolder
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        final_backup_dir = os.path.join(backup_dest, f"Backup_{timestamp}")
+        os.makedirs(final_backup_dir, exist_ok=True)
+        
         reply = QMessageBox.question(
             self, "Confirm Backup",
             f"Request backup from {len(keys)} client(s)?\n\n"
-            f"Source: {source_path}\n"
-            f"Destination: {BACKUP_DIR}",
+            f"Source (on clients): {source_path}\n"
+            f"Destination (on this PC): {final_backup_dir}\n\n"
+            f"Files will be organized by client hostname.",
             QMessageBox.Yes | QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
-            success_count = self.server.request_backup_from_clients(keys, source_path)
-            QMessageBox.information(
-                self, "Backup Started",
-                f"Backup request sent to {success_count} client(s)\n\n"
-                f"Files will be saved to:\n{BACKUP_DIR}"
-            )
+            # Store the custom backup directory in server
+            self.server.custom_backup_dir = final_backup_dir
+            
+            try:
+                success_count = self.server.request_backup_from_clients(keys, source_path)
+                QMessageBox.information(
+                    self, "Backup Started",
+                    f"Backup request sent to {success_count} client(s)\n\n"
+                    f"Files will be saved to:\n{final_backup_dir}\n\n"
+                    f"Check the log for progress updates."
+                )
+            finally:
+                # Clear custom backup directory
+                self.server.custom_backup_dir = None
     
     def restore_client_files(self):
         """Restore backed up files to selected clients"""

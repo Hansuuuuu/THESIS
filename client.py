@@ -1,6 +1,6 @@
 """
-Lab Manager - Student Client - FIXED AUTO-RECONNECT
-Continuously reconnects every 5 seconds until connected
+Lab Manager - Student Client - FIXED Qt THREADING ISSUES
+All Qt operations now properly use signals and run in the main thread
 """
 
 import sys
@@ -30,23 +30,23 @@ except ImportError as e:
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QLabel, QVBoxLayout, QPushButton,
     QMessageBox, QTextEdit, QProgressBar, QHBoxLayout,
-    QSystemTrayIcon, QMenu, QAction, QInputDialog
+    QSystemTrayIcon, QMenu, QAction, QInputDialog, QLineEdit, QProgressDialog
 )
 from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
 from PyQt5.QtGui import QPixmap, QIcon, QFont, QImage, QPainter, QColor
 from PyQt5.QtCore import QByteArray
 
 # Configuration
-SERVER_HOST = '192.168.68.104'  # Change to admin IP if on different computer
+SERVER_HOST = '192.168.100.30'
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
-RECONNECT_DELAY = 5000  # 5 seconds
+RECONNECT_DELAY = 5000
 SCREENSHOT_QUALITY = 60
 CHUNK_SIZE = 4 * 1024 * 1024
 SOCKET_SEND_BUFFER = 16 * 1024 * 1024
 SOCKET_RECV_BUFFER = 16 * 1024 * 1024
 BATCH_ACK_SIZE = 10
-RESTORE_TEMP_DIR = os.path.join(os.path.expanduser("~"), "lab_restore_temp")  # NEW: Temporary restore location
+RESTORE_TEMP_DIR = os.path.join(os.path.expanduser("~"), "lab_restore_temp")
 RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache_client")
 os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
 
@@ -64,6 +64,10 @@ class SignalHandler(QObject):
     show_message = pyqtSignal(str, str)
     file_progress = pyqtSignal(int, str)
     log_message = pyqtSignal(str)
+    # NEW: Signal for progress dialog operations
+    show_progress_dialog = pyqtSignal(str, int)  # title, max_value
+    update_progress_dialog = pyqtSignal(int, str)  # value, label
+    close_progress_dialog = pyqtSignal()
 
 
 class LockSignals(QObject):
@@ -195,8 +199,6 @@ class PresentationOverlay(QWidget):
 
 
 class LockOverlay(QWidget):
-    """Full-screen overlay that blocks all input and shows a lock message"""
-    
     def __init__(self, message="🔒 Locked by Administrator", logo_path=None, parent=None):
         super().__init__()
         self.parent_window = parent
@@ -207,11 +209,7 @@ class LockOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, False)
         self.setFocusPolicy(Qt.StrongFocus)
         
-        self.setStyleSheet("""
-            QWidget {
-                background-color: #000000;
-            }
-        """)
+        self.setStyleSheet("QWidget { background-color: #000000; }")
         
         if logo_path and os.path.exists(logo_path):
             try:
@@ -342,17 +340,25 @@ class StudentClient(QWidget):
         self.screen_sharing = False
         self.locked = False
         self.running = True
-        self.reconnect_timer = None
-        self.heartbeat_timer = None
         self.sharing_active = False
         self.connecting = False
-        self.reconnect_scheduled = False  # NEW: Track if reconnect is scheduled
+        self.reconnect_scheduled = False
+        
+        # Progress dialog (created in main thread)
+        self.progress_dialog = None
+        
+        self.custom_pc_name = self.load_custom_pc_name()
+        self.setWindowTitle(f"Student Client - {self.custom_pc_name}")
         
         self.signals = SignalHandler()
         self.signals.update_status.connect(self.update_status_label)
         self.signals.show_message.connect(self.display_message)
         self.signals.file_progress.connect(self.update_file_progress)
         self.signals.log_message.connect(self.append_log)
+        # NEW: Connect progress dialog signals
+        self.signals.show_progress_dialog.connect(self._show_progress_dialog)
+        self.signals.update_progress_dialog.connect(self._update_progress_dialog)
+        self.signals.close_progress_dialog.connect(self._close_progress_dialog)
         
         self.lock_signals = LockSignals()
         self.lock_signals.lock_requested.connect(self._create_lock_overlay)
@@ -401,6 +407,10 @@ class StudentClient(QWidget):
         self.share_screen_button = QPushButton("📷 Share Screen")
         self.share_screen_button.clicked.connect(self.toggle_screen_share)
         button_layout.addWidget(self.share_screen_button)
+        
+        self.change_name_button = QPushButton("✏️ Change PC Name")
+        self.change_name_button.clicked.connect(self.change_pc_name)
+        button_layout.addWidget(self.change_name_button)
         
         self.minimize_button = QPushButton("➖ Minimize to Tray")
         self.minimize_button.clicked.connect(self.hide)
@@ -451,11 +461,16 @@ class StudentClient(QWidget):
             tray_menu = QMenu()
             show_action = QAction("Show Window", self)
             show_action.triggered.connect(self.show)
+            tray_menu.addAction(show_action)
+            
+            change_name_action = QAction("Change PC Name", self)
+            change_name_action.triggered.connect(self.change_pc_name)
+            tray_menu.addAction(change_name_action)
+            
+            tray_menu.addSeparator()
+            
             quit_action = QAction("Exit", self)
             quit_action.triggered.connect(self.quit_application)
-            
-            tray_menu.addAction(show_action)
-            tray_menu.addSeparator()
             tray_menu.addAction(quit_action)
             
             self.tray_icon.setContextMenu(tray_menu)
@@ -492,8 +507,35 @@ class StudentClient(QWidget):
         else:
             self.status_label.setStyleSheet("background-color: #3c3c3c; padding: 15px; border-radius: 8px;")
     
+    # NEW: Thread-safe progress dialog methods
+    def _show_progress_dialog(self, title, max_value):
+        """Create progress dialog in main thread"""
+        if self.progress_dialog is not None:
+            self.progress_dialog.close()
+        
+        self.progress_dialog = QProgressDialog(title, "Cancel", 0, max_value, self)
+        self.progress_dialog.setWindowTitle("Operation in Progress")
+        self.progress_dialog.setWindowModality(Qt.WindowModal)
+        self.progress_dialog.setAutoClose(True)
+        self.progress_dialog.setMinimumDuration(0)
+        self.progress_dialog.show()
+        QApplication.processEvents()
+    
+    def _update_progress_dialog(self, value, label):
+        """Update progress dialog in main thread"""
+        if self.progress_dialog is not None:
+            self.progress_dialog.setValue(value)
+            if label:
+                self.progress_dialog.setLabelText(label)
+            QApplication.processEvents()
+    
+    def _close_progress_dialog(self):
+        """Close progress dialog in main thread"""
+        if self.progress_dialog is not None:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+    
     def schedule_reconnect(self):
-        """Schedule a reconnect attempt after RECONNECT_DELAY"""
         if not self.running or self.connected or self.reconnect_scheduled:
             return
         
@@ -502,13 +544,11 @@ class StudentClient(QWidget):
         QTimer.singleShot(RECONNECT_DELAY, self._do_scheduled_reconnect)
     
     def _do_scheduled_reconnect(self):
-        """Execute the scheduled reconnect"""
         self.reconnect_scheduled = False
         if not self.connected and self.running:
             self.attempt_connection()
     
     def attempt_connection(self):
-        # Prevent multiple simultaneous connection attempts
         if self.connecting or self.connected:
             return
         
@@ -524,12 +564,11 @@ class StudentClient(QWidget):
         def connect_thread():
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.settimeout(5)  # 5 second timeout for connection attempt
+                sock.settimeout(5)
                 
                 sock.connect((SERVER_HOST, SERVER_PORT))
                 sock.settimeout(None)
                 
-                # Success!
                 self.client_socket = sock
                 self.connected = True
                 self.connecting = False
@@ -538,7 +577,10 @@ class StudentClient(QWidget):
                 self.log("✅ Successfully connected to server")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(False))
                 
+                QTimer.singleShot(100, self.send_client_info)
+                
                 threading.Thread(target=self.listen_for_commands, daemon=True).start()
+                # FIXED: Use QTimer.singleShot instead of creating timer in thread
                 QTimer.singleShot(0, self.start_heartbeat)
             
             except (socket.timeout, TimeoutError):
@@ -547,8 +589,6 @@ class StudentClient(QWidget):
                 self.signals.update_status.emit(f"❌ Connection timeout", "red")
                 self.log(f"Connection timeout - Server may be offline")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(True))
-                
-                # FIXED: Always schedule reconnect
                 QTimer.singleShot(0, self.schedule_reconnect)
             
             except ConnectionRefusedError:
@@ -557,8 +597,6 @@ class StudentClient(QWidget):
                 self.signals.update_status.emit(f"❌ Connection refused", "red")
                 self.log(f"Connection refused - Admin application not running")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(True))
-                
-                # FIXED: Always schedule reconnect
                 QTimer.singleShot(0, self.schedule_reconnect)
             
             except Exception as e:
@@ -568,8 +606,6 @@ class StudentClient(QWidget):
                 self.signals.update_status.emit(f"❌ Connection failed", "red")
                 self.log(f"Connection failed: {error_msg}")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(True))
-                
-                # FIXED: Always schedule reconnect
                 QTimer.singleShot(0, self.schedule_reconnect)
         
         threading.Thread(target=connect_thread, daemon=True).start()
@@ -577,11 +613,7 @@ class StudentClient(QWidget):
     def manual_reconnect(self):
         self.log("📍 Manual reconnect requested")
         self.reconnect_button.setEnabled(False)
-        
-        # Cancel any scheduled reconnect
         self.reconnect_scheduled = False
-        
-        # Disconnect and reconnect immediately
         self.disconnect_socket()
         QTimer.singleShot(500, self.attempt_connection)
     
@@ -599,13 +631,14 @@ class StudentClient(QWidget):
             self.client_socket = None
     
     def start_heartbeat(self):
+        """FIXED: Create timer in main thread"""
         self.stop_heartbeat()
         self.heartbeat_timer = QTimer(self)
         self.heartbeat_timer.timeout.connect(self.send_heartbeat)
-        self.heartbeat_timer.start(10000)  # 10 seconds
+        self.heartbeat_timer.start(10000)
     
     def stop_heartbeat(self):
-        if self.heartbeat_timer:
+        if hasattr(self, 'heartbeat_timer') and self.heartbeat_timer:
             try:
                 self.heartbeat_timer.stop()
                 self.heartbeat_timer.deleteLater()
@@ -623,7 +656,6 @@ class StudentClient(QWidget):
                 self.signals.update_status.emit("❌ Connection lost", "red")
                 self.reconnect_button.setEnabled(True)
                 
-                # Schedule reconnect after heartbeat failure
                 if self.running:
                     self.schedule_reconnect()
     
@@ -699,12 +731,10 @@ class StudentClient(QWidget):
                     break
                 time.sleep(0.1)
         
-        # Connection ended - cleanup and schedule reconnect
         self.disconnect_socket()
         self.signals.update_status.emit("❌ Disconnected", "red")
         self.reconnect_button.setEnabled(True)
         
-        # FIXED: Always schedule reconnect when disconnected
         if self.running:
             self.log("Connection lost - auto-reconnect scheduled")
             QTimer.singleShot(0, self.schedule_reconnect)
@@ -744,6 +774,15 @@ class StudentClient(QWidget):
             threading.Thread(
                 target=self.send_file_to_admin,
                 args=(file_path,),
+                daemon=True
+            ).start()
+        
+        elif command.startswith("BACKUP_REQUEST:"):
+            source_path = command.split(":", 1)[1]
+            self.log(f"💾 Backup requested: {source_path}")
+            threading.Thread(
+                target=self.handle_backup_request,
+                args=(source_path,),
                 daemon=True
             ).start()
     
@@ -1113,314 +1152,6 @@ class StudentClient(QWidget):
         
         threading.Thread(target=share_loop, daemon=True).start()
     
-    def receive_loop(self):
-        buffer = b""
-        
-        while self.connected and self.running:
-            try:
-                chunk = self.client_socket.recv(BUFFER_SIZE)
-                if not chunk:
-                    break
-                
-                buffer += chunk
-                
-                while b"\n" in buffer:
-                    idx = buffer.find(b"\n")
-                    line = buffer[:idx]
-                    buffer = buffer[idx + 1:]
-                    
-                    if line.startswith(b"INIT"):
-                        buffer = self.handle_file_transfer_init(buffer)
-                    
-                    elif line.startswith(b"LOCK:"):
-                        message = line[5:].decode("utf-8", errors="ignore")
-                        self.lock_signals.lock_requested.emit(message)
-                    
-                    elif line == b"UNLOCK":
-                        self.lock_signals.unlock_requested.emit()
-                    
-                    elif line.startswith(b"MESSAGE:"):
-                        message = line[8:].decode("utf-8", errors="ignore")
-                        self.signals.show_message.emit("Message from Admin", message)
-                    
-                    elif line == b"REQUEST_SCREENSHOT":
-                        threading.Thread(target=self.send_screen_once, daemon=True).start()
-                    
-                    elif line == b"PRESENT_START":
-                        self.start_presentation_mode()
-                    
-                    elif line == b"PRESENT_STOP":
-                        self.stop_presentation_mode()
-                    
-                    elif line.startswith(b"PRESENT_FRAME"):
-                        if len(buffer) >= 8:
-                            size = struct.unpack(">Q", buffer[:8])[0]
-                            buffer = buffer[8:]
-                            
-                            while len(buffer) < size:
-                                chunk = self.client_socket.recv(BUFFER_SIZE)
-                                if not chunk:
-                                    break
-                                buffer += chunk
-                            
-                            frame_data = buffer[:size]
-                            buffer = buffer[size:]
-                            
-                            if self.presentation_overlay:
-                                self.presentation_overlay.update_frame(frame_data)
-                    
-                    # NEW: Handle backup request
-                    elif line.startswith(b"BACKUP_REQUEST:"):
-                        source_path = line[15:].decode("utf-8", errors="ignore")
-                        threading.Thread(target=self.handle_backup_request, 
-                                       args=(source_path,), daemon=True).start()
-                    
-                    # NEW: Handle restore request
-                    elif line.startswith(b"RESTORE_START:"):
-                        restore_path = line[14:].decode("utf-8", errors="ignore")
-                        self.restore_target_path = restore_path
-                        self.log(f"📥 Restore initiated to: {restore_path}")
-            
-            except Exception as e:
-                if self.connected:
-                    self.log(f"⚠️ Receive error: {e}")
-                break
-        
-        self.log("🔌 Disconnected from server")
-        self.disconnect_socket()
-        self.signals.update_status.emit("⚪ Disconnected", "red")
-        
-        if self.running:
-            QTimer.singleShot(RECONNECT_DELAY, self.attempt_connection)
-    
-    # NEW: Handle backup request from admin
-    def handle_backup_request(self, source_path):
-        try:
-            self.log(f"💾 Backup requested: {source_path}")
-            
-            if not os.path.exists(source_path):
-                error_msg = f"Path not found: {source_path}"
-                self.log(f"❌ {error_msg}")
-                self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
-                return
-            
-            # Create temporary zip file
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            temp_zip = os.path.join(RESUME_METADATA_DIR, f"backup_{timestamp}.zip")
-            
-            self.log(f"📦 Creating backup archive...")
-            
-            with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                if os.path.isfile(source_path):
-                    zipf.write(source_path, os.path.basename(source_path))
-                else:
-                    for root, dirs, files in os.walk(source_path):
-                        for file in files:
-                            file_path = os.path.join(root, file)
-                            arcname = os.path.relpath(file_path, source_path)
-                            try:
-                                zipf.write(file_path, arcname)
-                            except Exception as e:
-                                self.log(f"⚠️ Skipped: {file} ({e})")
-            
-            # Read zip file
-            with open(temp_zip, 'rb') as f:
-                zip_data = f.read()
-            
-            # Send backup data
-            self.log(f"📤 Sending backup ({format_bytes(len(zip_data))})...")
-            header = f"BACKUP_DATA:{len(zip_data)}\n".encode("utf-8")
-            self.client_socket.sendall(header + zip_data)
-            
-            # Clean up
-            try:
-                os.remove(temp_zip)
-            except:
-                pass
-            
-            self.log(f"✅ Backup sent successfully")
-            self.signals.show_message.emit("Backup Complete", 
-                                          f"Files backed up to admin from:\n{source_path}")
-        
-        except Exception as e:
-            error_msg = f"Backup failed: {e}"
-            self.log(f"❌ {error_msg}")
-            try:
-                self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
-            except:
-                pass
-    
-    def handle_file_transfer_init(self, buffer):
-        try:
-            if len(buffer) < 8:
-                return buffer
-            
-            size = struct.unpack(">Q", buffer[:8])[0]
-            buffer = buffer[8:]
-            
-            while len(buffer) < size:
-                chunk = self.client_socket.recv(BUFFER_SIZE)
-                if not chunk:
-                    break
-                buffer += chunk
-            
-            init_data = buffer[:size]
-            buffer = buffer[size:]
-            
-            init_info = json.loads(init_data.decode("utf-8"))
-            
-            transfer_id = init_info["transfer_id"]
-            filename = init_info["filename"]
-            destination = init_info["destination"]
-            filesize = init_info["filesize"]
-            total_chunks = init_info["total_chunks"]
-            chunk_size = init_info["chunk_size"]
-            
-            # NEW: Check if this is a restore operation
-            is_restore = destination == "RESTORE_TEMP"
-            
-            if is_restore:
-                filepath = os.path.join(RESTORE_TEMP_DIR, filename)
-                self.log(f"📥 Receiving restore file: {filename}")
-            else:
-                filepath = self._resolve_destination_path(destination, filename)
-                if not filepath:
-                    return buffer
-                self.log(f"📥 Receiving: {filename} ({format_bytes(filesize)})")
-            
-            self.signals.file_progress.emit(0, f"Starting: {filename}")
-            
-            receiver = ResumableFileReceiver(transfer_id, filename, destination, filesize, total_chunks)
-            
-            chunk_data_map = {}
-            chunks_since_ack = 0
-            last_update = time.time()
-            
-            try:
-                while not receiver.is_complete():
-                    if len(buffer) < 6:
-                        chunk = self.client_socket.recv(BUFFER_SIZE)
-                        if not chunk:
-                            break
-                        buffer += chunk
-                    
-                    if buffer[:6] == b"CHUNK\n":
-                        buffer = buffer[6:]
-                        
-                        while len(buffer) < 16:
-                            chunk = self.client_socket.recv(BUFFER_SIZE)
-                            if not chunk:
-                                break
-                            buffer += chunk
-                        
-                        chunk_index, chunk_len = struct.unpack(">QQ", buffer[:16])
-                        buffer = buffer[16:]
-                        
-                        while len(buffer) < chunk_len:
-                            chunk = self.client_socket.recv(BUFFER_SIZE)
-                            if not chunk:
-                                break
-                            buffer += chunk
-                        
-                        chunk_data = buffer[:chunk_len]
-                        buffer = buffer[chunk_len:]
-                        
-                        if not receiver.is_chunk_received(chunk_index):
-                            chunk_data_map[chunk_index] = chunk_data
-                            checksum = receiver._calculate_chunk_checksum(chunk_data)
-                            receiver.received_chunks[chunk_index] = checksum
-                            chunks_since_ack += 1
-                        
-                        progress = receiver.get_progress()
-                        current_time = time.time()
-                        if current_time - last_update >= 0.5:
-                            self.signals.file_progress.emit(int(progress), 
-                                                           f"{filename}: {progress:.1f}%")
-                            last_update = time.time()
-                    
-                    elif buffer[:18] == b"TRANSFER_COMPLETE\n":
-                        buffer = buffer[18:]
-                        break
-                    
-                    if chunks_since_ack >= BATCH_ACK_SIZE:
-                        receiver._save_progress()
-                        chunks_since_ack = 0
-                        last_update = time.time()
-                
-                if chunks_since_ack > 0:
-                    try:
-                        self.client_socket.sendall(b"CHUNK_OK\n")
-                    except:
-                        pass
-            
-            except Exception as e:
-                self.log(f"Transfer error: {e}")
-                raise
-            
-            if receiver.is_complete():
-                self.log(f"Writing to disk...")
-                try:
-                    with open(filepath, "wb") as f:
-                        for i in range(total_chunks):
-                            if i in chunk_data_map:
-                                f.write(chunk_data_map[i])
-                    
-                    try:
-                        self.client_socket.sendall(b"VERIFIED\n")
-                    except:
-                        pass
-                    
-                    receiver.cleanup()
-                    self.signals.file_progress.emit(100, f"Complete: {filename}")
-                    self.log(f"✅ Saved: {filepath}")
-                    
-                    # NEW: Handle restore extraction
-                    if is_restore:
-                        threading.Thread(target=self.extract_restore_files, 
-                                       args=(filepath,), daemon=True).start()
-                    else:
-                        self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
-                    
-                    QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
-                
-                except Exception as e:
-                    self.log(f"Write error: {e}")
-                    raise
-        
-        except Exception as e:
-            self.log(f"Transfer error: {e}")
-            self.signals.file_progress.emit(0, f"Error")
-        
-        return buffer
-    
-    # NEW: Extract and restore files
-    def extract_restore_files(self, zip_path):
-        try:
-            self.log(f"📦 Extracting restore files...")
-            
-            restore_path = getattr(self, 'restore_target_path', None)
-            if not restore_path:
-                restore_path = os.path.join(os.path.expanduser("~"), "Documents", "RestoredFiles")
-            
-            os.makedirs(restore_path, exist_ok=True)
-            
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(restore_path)
-            
-            # Clean up
-            try:
-                os.remove(zip_path)
-            except:
-                pass
-            
-            self.log(f"✅ Files restored to: {restore_path}")
-            self.signals.show_message.emit("Restore Complete", 
-                                          f"Files restored to:\n{restore_path}")
-        
-        except Exception as e:
-            self.log(f"❌ Restore extraction failed: {e}")
-            self.signals.show_message.emit("Restore Error", f"Failed to extract files: {e}")
-    
     def stop_screen_share(self):
         if getattr(self, 'sharing_active', False):
             self.sharing_active = False
@@ -1466,6 +1197,279 @@ class StudentClient(QWidget):
             except:
                 self.screen_sharing = False
     
+    def handle_backup_request(self, source_path):
+        """FIXED: Use signals for progress dialog instead of creating in thread"""
+        try:
+            self.log(f"💾 Backup requested: {source_path}")
+            
+            if not os.path.exists(source_path):
+                error_msg = f"Path not found: {source_path}"
+                self.log(f"❌ {error_msg}")
+                self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
+                return
+            
+            # Show progress dialog via signal
+            self.signals.show_progress_dialog.emit("Preparing backup...", 100)
+            
+            # Scan files
+            self.signals.update_progress_dialog.emit(5, "Scanning files...")
+            
+            file_list = []
+            total_size = 0
+            for root, dirs, files in os.walk(source_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    try:
+                        size = os.path.getsize(file_path)
+                        file_list.append((file_path, size))
+                        total_size += size
+                    except:
+                        pass
+            
+            file_count = len(file_list)
+            self.log(f"📊 Found {file_count} files ({format_bytes(total_size)})")
+            
+            # Create temporary zip file
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            temp_zip = os.path.join(RESUME_METADATA_DIR, f"backup_{timestamp}.zip")
+            
+            self.signals.update_progress_dialog.emit(10, f"Creating backup archive...\n0 / {file_count} files")
+            
+            # Create zip with progress
+            with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                if os.path.isfile(source_path):
+                    zipf.write(source_path, os.path.basename(source_path))
+                    self.signals.update_progress_dialog.emit(60, "Backup created")
+                else:
+                    processed = 0
+                    for file_path, _ in file_list:
+                        arcname = os.path.relpath(file_path, source_path)
+                        try:
+                            zipf.write(file_path, arcname)
+                        except Exception as e:
+                            self.log(f"⚠️ Skipped: {os.path.basename(file_path)} ({e})")
+                        
+                        processed += 1
+                        if processed % max(1, file_count // 50) == 0:
+                            percent = 10 + int((processed / file_count) * 50)
+                            self.signals.update_progress_dialog.emit(
+                                percent,
+                                f"Creating backup archive...\n{processed} / {file_count} files"
+                            )
+            
+            self.signals.update_progress_dialog.emit(65, "Reading backup file...")
+            
+            # Read zip file
+            with open(temp_zip, 'rb') as f:
+                zip_data = f.read()
+            
+            zip_size = len(zip_data)
+            self.log(f"📦 Backup size: {format_bytes(zip_size)}")
+            
+            # Send backup data with progress
+            self.signals.update_progress_dialog.emit(
+                70,
+                f"Uploading backup...\n0% ({format_bytes(0)} / {format_bytes(zip_size)})"
+            )
+            
+            # Send header
+            header = f"BACKUP_DATA:{zip_size}\n".encode("utf-8")
+            self.client_socket.sendall(header)
+            
+            # Send data in chunks with progress
+            chunk_size = 1024 * 1024
+            sent = 0
+            while sent < zip_size:
+                chunk = zip_data[sent:sent + chunk_size]
+                self.client_socket.sendall(chunk)
+                sent += len(chunk)
+                
+                # Update progress
+                upload_percent = int((sent / zip_size) * 100)
+                overall_percent = 70 + int(upload_percent * 0.30)
+                self.signals.update_progress_dialog.emit(
+                    overall_percent,
+                    f"Uploading backup...\n{upload_percent}% ({format_bytes(sent)} / {format_bytes(zip_size)})"
+                )
+            
+            self.signals.update_progress_dialog.emit(100, "Backup complete!")
+            
+            # Clean up
+            try:
+                os.remove(temp_zip)
+            except:
+                pass
+            
+            self.log(f"✅ Backup sent successfully ({format_bytes(zip_size)})")
+            
+            # Close progress dialog and show success message
+            self.signals.close_progress_dialog.emit()
+            QTimer.singleShot(500, lambda: self.signals.show_message.emit(
+                "Backup Complete", 
+                f"Successfully backed up {file_count} files\n"
+                f"Total size: {format_bytes(zip_size)}\n"
+                f"From: {source_path}"
+            ))
+        
+        except Exception as e:
+            error_msg = f"Backup failed: {e}"
+            self.log(f"❌ {error_msg}")
+            try:
+                self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
+            except:
+                pass
+            self.signals.close_progress_dialog.emit()
+            self.signals.show_message.emit("Backup Error", error_msg)
+    
+    def load_custom_pc_name(self):
+        try:
+            import socket
+            config_file = os.path.join(RESUME_METADATA_DIR, "pc_name.txt")
+            if os.path.exists(config_file):
+                with open(config_file, 'r') as f:
+                    name = f.read().strip()
+                    if name:
+                        return name
+        except:
+            pass
+        
+        try:
+            import socket
+            return socket.gethostname()
+        except:
+            return "Student-PC"
+    
+    def save_custom_pc_name(self, name):
+        try:
+            config_file = os.path.join(RESUME_METADATA_DIR, "pc_name.txt")
+            with open(config_file, 'w') as f:
+                f.write(name)
+            return True
+        except Exception as e:
+            self.log(f"Failed to save PC name: {e}")
+            return False
+    
+    def change_pc_name(self):
+        new_name, ok = QInputDialog.getText(
+            self,
+            "Change PC Name",
+            "Enter new PC name for this computer:",
+            QLineEdit.Normal,
+            self.custom_pc_name
+        )
+        
+        if ok and new_name and new_name.strip():
+            new_name = new_name.strip()
+            old_name = self.custom_pc_name
+            self.custom_pc_name = new_name
+            
+            if self.save_custom_pc_name(new_name):
+                self.setWindowTitle(f"Student Client - {self.custom_pc_name}")
+                self.log(f"PC name changed from '{old_name}' to '{new_name}'")
+                
+                if self.connected:
+                    self.send_client_info()
+                
+                QMessageBox.information(
+                    self,
+                    "PC Name Changed",
+                    f"PC name successfully changed to:\n{new_name}\n\n"
+                    f"The admin will see this name for backups and identification."
+                )
+            else:
+                self.custom_pc_name = old_name
+                QMessageBox.warning(
+                    self,
+                    "Error",
+                    "Failed to save PC name. Please try again."
+                )
+    
+    def send_client_info(self):
+        if not self.connected or not self.client_socket:
+            return
+        
+        try:
+            info = {
+                "hostname": self.custom_pc_name,
+                "status": "connected"
+            }
+            info_json = json.dumps(info)
+            self.client_socket.sendall(f"INFO:{info_json}\n".encode("utf-8"))
+            self.log(f"Sent client info to admin: {self.custom_pc_name}")
+        except Exception as e:
+            self.log(f"Failed to send client info: {e}")
+    
+    def collect_and_send_files(self, source_path):
+        try:
+            self.log(f"Collecting files from: {source_path}")
+            files_data = []
+            
+            for root, dirs, files in os.walk(source_path):
+                for filename in files:
+                    file_path = os.path.join(root, filename)
+                    try:
+                        file_hash = self._calculate_file_hash(file_path)
+                        
+                        files_data.append({
+                            "path": file_path,
+                            "name": filename,
+                            "hash": file_hash,
+                            "size": os.path.getsize(file_path)
+                        })
+                    except:
+                        pass
+            
+            file_list_json = json.dumps(files_data)
+            header = f"FILE_LIST:{len(file_list_json)}\n"
+            
+            self.client_socket.sendall(header.encode())
+            self.client_socket.sendall(file_list_json.encode())
+            
+            self.log(f"Sent file list: {len(files_data)} files from {source_path}")
+            
+        except Exception as e:
+            self.log(f"Error collecting files: {e}")
+    
+    def send_file_to_admin(self, file_path):
+        try:
+            if not os.path.exists(file_path):
+                return
+            
+            header = b"ADMIN_FILE\n"
+            metadata = {
+                "path": file_path,
+                "name": os.path.basename(file_path)
+            }
+            meta_json = json.dumps(metadata).encode()
+            meta_len = struct.pack(">I", len(meta_json))
+            
+            self.client_socket.sendall(header)
+            self.client_socket.sendall(meta_len)
+            self.client_socket.sendall(meta_json)
+            
+            with open(file_path, "rb") as f:
+                while True:
+                    chunk = f.read(BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    self.client_socket.sendall(chunk)
+            
+            self.client_socket.sendall(b"<END>")
+            self.log(f"File sent to admin: {os.path.basename(file_path)}")
+            
+        except Exception as e:
+            self.log(f"Error sending file to admin: {e}")
+    
+    def _calculate_file_hash(self, file_path):
+        sha256 = hashlib.sha256()
+        try:
+            with open(file_path, "rb") as f:
+                for chunk in iter(lambda: f.read(4096), b""):
+                    sha256.update(chunk)
+            return sha256.hexdigest()
+        except:
+            return ""
+    
     def quit_application(self):
         self.running = False
         self.reconnect_scheduled = False
@@ -1487,90 +1491,7 @@ class StudentClient(QWidget):
         else:
             event.ignore()
             self.showMinimized()
-        
 
-    def collect_and_send_files(self, source_path):
-        """Collect files from source path and send list to admin"""
-        try:
-            self.log(f"Collecting files from: {source_path}")
-            files_data = []
-            
-            # Scan directory recursively
-            for root, dirs, files in os.walk(source_path):
-                for filename in files:
-                    file_path = os.path.join(root, filename)
-                    try:
-                        # Calculate file hash for change detection
-                        file_hash = self._calculate_file_hash(file_path)
-                        
-                        files_data.append({
-                            "path": file_path,
-                            "name": filename,
-                            "hash": file_hash,
-                            "size": os.path.getsize(file_path)
-                        })
-                    except Exception as e:
-                        pass  # Skip files that can't be read
-            
-            # Send file list to admin
-            file_list_json = json.dumps(files_data)
-            header = f"FILE_LIST:{len(file_list_json)}\n"
-            
-            self.client_socket.sendall(header.encode())
-            self.client_socket.sendall(file_list_json.encode())
-            
-            self.log(f"Sent file list: {len(files_data)} files from {source_path}")
-            
-        except Exception as e:
-            self.log(f"Error collecting files: {e}")
-
-
-    def send_file_to_admin(self, file_path):
-        """Send a specific file to admin"""
-        try:
-            if not os.path.exists(file_path):
-                return
-            
-            file_size = os.path.getsize(file_path)
-            
-            # Send file with special header
-            header = b"ADMIN_FILE\n"
-            metadata = {
-                "path": file_path,
-                "name": os.path.basename(file_path)
-            }
-            meta_json = json.dumps(metadata).encode()
-            meta_len = struct.pack(">I", len(meta_json))
-            
-            self.client_socket.sendall(header)
-            self.client_socket.sendall(meta_len)
-            self.client_socket.sendall(meta_json)
-            
-            # Send file
-            with open(file_path, "rb") as f:
-                while True:
-                    chunk = f.read(BUFFER_SIZE)
-                    if not chunk:
-                        break
-                    self.client_socket.sendall(chunk)
-            
-            self.client_socket.sendall(b"<END>")
-            self.log(f"File sent to admin: {os.path.basename(file_path)}")
-            
-        except Exception as e:
-            self.log(f"Error sending file to admin: {e}")
-
-
-    def _calculate_file_hash(self, file_path):
-        """Calculate SHA256 hash of file"""
-        sha256 = hashlib.sha256()
-        try:
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(4096), b""):
-                    sha256.update(chunk)
-            return sha256.hexdigest()
-        except:
-            return ""
 
 def main():
     try:
