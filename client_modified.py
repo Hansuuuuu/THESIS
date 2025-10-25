@@ -37,15 +37,15 @@ from PyQt5.QtGui import QPixmap, QIcon, QFont, QImage, QPainter, QColor
 from PyQt5.QtCore import QByteArray
 
 # Configuration
-SERVER_HOST = '192.168.100.30'
+SERVER_HOST = '192.168.68.105'
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000
 SCREENSHOT_QUALITY = 60
-CHUNK_SIZE = 4 * 1024 * 1024
-SOCKET_SEND_BUFFER = 16 * 1024 * 1024
-SOCKET_RECV_BUFFER = 16 * 1024 * 1024
-BATCH_ACK_SIZE = 10
+CHUNK_SIZE = 8 * 1024 * 1024  # Increased to 8MB
+SOCKET_SEND_BUFFER = 32 * 1024 * 1024  # Increased
+SOCKET_RECV_BUFFER = 32 * 1024 * 1024  # Increased
+BATCH_ACK_SIZE = 20  # Increased from 10
 RESTORE_TEMP_DIR = os.path.join(os.path.expanduser("~"), "lab_restore_temp")
 RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache_client")
 os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
@@ -703,6 +703,12 @@ class StudentClient(QWidget):
                                 self.log(f"Transfer error: {e}")
                             continue
                         
+                        elif command.startswith("RESTORE_START:"):
+                            # FIXED: Store restore destination
+                            self.restore_destination = command.split(":", 1)[1]
+                            self.log(f"📥 Restore initiated to: {self.restore_destination}")
+                            continue
+                        
                         else:
                             self.log(f"Received: {command}")
                             threading.Thread(
@@ -897,6 +903,7 @@ class StudentClient(QWidget):
             self.presentation_overlay.update_frame(frame_data)
     
     def _handle_resumable_transfer(self, buffer):
+        """OPTIMIZED: Faster file reception"""
         def recv_more(timeout=None):
             try:
                 if timeout:
@@ -904,41 +911,64 @@ class StudentClient(QWidget):
                 return self.client_socket.recv(BUFFER_SIZE)
             except (BlockingIOError, socket.timeout):
                 return b""
+            finally:
+                # Reset timeout
+                try:
+                    self.client_socket.settimeout(1.0)
+                except:
+                    pass
         
         def ensure_in_buffer(n):
             nonlocal buffer
             attempts = 0
+            max_attempts = 300
             while len(buffer) < n:
                 if b"TRANSFER_COMPLETE\n" in buffer:
                     return True
                 chunk = recv_more(1.0)
                 if chunk == b"":
                     attempts += 1
-                    if attempts >= 300:
+                    if attempts >= max_attempts:
+                        self.log(f"❌ Timeout waiting for data (needed {n}, have {len(buffer)})")
                         return False
                     time.sleep(0.01)
                     continue
                 buffer += chunk
+                attempts = 0  # Reset on successful receive
             return True
         
         try:
+            self.log("📥 Processing file transfer...")
+            
+            # OPTIMIZED: Configure socket
             try:
                 self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECV_BUFFER)
-            except:
-                pass
+                self.client_socket.settimeout(30.0)  # Set reasonable timeout
+            except Exception as e:
+                self.log(f"⚠️ Socket config warning: {e}")
             
+            # Read header length
             if not ensure_in_buffer(4):
+                self.log("❌ Failed to read header length")
                 return buffer
             
             header_len = struct.unpack(">I", buffer[:4])[0]
             buffer = buffer[4:]
             
+            self.log(f"📋 Header length: {header_len} bytes")
+            
+            # Read metadata
             if not ensure_in_buffer(header_len):
+                self.log("❌ Failed to read metadata")
                 return buffer
             
-            metadata = json.loads(buffer[:header_len].decode("utf-8"))
-            buffer = buffer[header_len:]
+            try:
+                metadata = json.loads(buffer[:header_len].decode("utf-8"))
+                buffer = buffer[header_len:]
+            except Exception as e:
+                self.log(f"❌ Failed to parse metadata: {e}")
+                return buffer
             
             transfer_id = metadata["transfer_id"]
             filename = metadata["filename"]
@@ -946,84 +976,116 @@ class StudentClient(QWidget):
             filesize = metadata["filesize"]
             total_chunks = metadata["total_chunks"]
             chunk_size = metadata.get("chunk_size", CHUNK_SIZE)
-            batch_ack_size = metadata.get("batch_ack_size", 5)
+            batch_ack_size = metadata.get("batch_ack_size", BATCH_ACK_SIZE)
             
-            self.log(f"📥 Receiving: {filename} ({filesize//1024//1024} MB)")
+            self.log(f"📥 Receiving: {filename} ({format_bytes(filesize)}, {total_chunks} chunks)")
             self.signals.file_progress.emit(0, f"Starting: {filename}")
             
             receiver = ResumableFileReceiver(transfer_id, filename, destination, filesize, total_chunks)
             
-            filepath = self._resolve_destination_path(destination, filename)
-            if not filepath:
-                try:
-                    self.client_socket.sendall(b"ERROR\n")
-                except:
-                    pass
-                return buffer
+            # FIXED: Handle RESTORE_TEMP destination
+            if destination == "RESTORE_TEMP":
+                filepath = os.path.join(RESTORE_TEMP_DIR, filename)
+                os.makedirs(RESTORE_TEMP_DIR, exist_ok=True)
+                self.log(f"💾 Restore mode: saving to {RESTORE_TEMP_DIR}")
+            else:
+                filepath = self._resolve_destination_path(destination, filename)
+                if not filepath:
+                    self.log("❌ Failed to resolve destination path")
+                    try:
+                        self.client_socket.sendall(b"ERROR:Invalid destination\n")
+                    except:
+                        pass
+                    return buffer
             
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             
+            # CRITICAL: Send READY immediately
+            self.log("✅ Ready to receive - sending READY")
             try:
                 self.client_socket.sendall(b"READY\n")
-            except:
+                self.client_socket.settimeout(1.0)  # Reset to normal timeout
+            except Exception as e:
+                self.log(f"❌ Failed to send READY: {e}")
                 return buffer
             
-            self.log("Receiving data...")
+            self.log("📊 Receiving chunks...")
             
             chunk_data_map = {}
             last_update = time.time()
             chunks_since_ack = 0
+            chunks_received = 0
             
             try:
                 while len(receiver.received_chunks) < total_chunks:
+                    # Check for completion marker
                     if b"TRANSFER_COMPLETE\n" in buffer:
                         idx = buffer.find(b"TRANSFER_COMPLETE\n")
                         buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
+                        self.log(f"📋 Transfer complete marker received")
                         break
                     
+                    # Ensure we have chunk header (index + size + checksum = 72 bytes)
                     if not ensure_in_buffer(72):
+                        self.log(f"⚠️ Failed to read chunk header")
                         break
                     
                     try:
                         chunk_index, chunk_data_size = struct.unpack(">II", buffer[:8])
-                    except:
+                    except Exception as e:
+                        self.log(f"❌ Failed to unpack chunk header: {e}")
                         break
                     
                     checksum = buffer[8:72].rstrip(b"\x00").decode("utf-8")
                     buffer = buffer[72:]
                     
+                    # Validate chunk index
+                    if chunk_index >= total_chunks:
+                        self.log(f"⚠️ Invalid chunk index {chunk_index} (max: {total_chunks})")
+                        break
+                    
+                    # Ensure we have chunk data
                     if not ensure_in_buffer(chunk_data_size):
+                        self.log(f"⚠️ Failed to read chunk {chunk_index} data ({chunk_data_size} bytes)")
                         break
                     
                     chunk_data = buffer[:chunk_data_size]
                     buffer = buffer[chunk_data_size:]
                     
+                    # Skip if already received
                     if receiver.is_chunk_received(chunk_index):
                         chunks_since_ack += 1
                         if chunks_since_ack >= batch_ack_size:
                             try:
                                 self.client_socket.sendall(b"CHUNK_OK\n")
-                            except:
+                            except Exception as e:
+                                self.log(f"❌ Failed to send ACK: {e}")
                                 return buffer
                             chunks_since_ack = 0
                         continue
                     
+                    # Verify checksum
                     actual_checksum = receiver._calculate_chunk_checksum(chunk_data)
                     if actual_checksum != checksum:
+                        self.log(f"❌ Checksum mismatch for chunk {chunk_index}")
                         try:
                             self.client_socket.sendall(b"CHUNK_ERROR\n")
                         except:
                             pass
                         break
                     
+                    # Store chunk
                     receiver.received_chunks[chunk_index] = checksum
                     chunk_data_map[chunk_index] = chunk_data
                     chunks_since_ack += 1
+                    chunks_received += 1
                     
+                    # Send batch acknowledgment
                     if chunks_since_ack >= batch_ack_size:
                         try:
                             self.client_socket.sendall(b"CHUNK_OK\n")
-                        except:
+                        except Exception as e:
+                            self.log(f"❌ Failed to send ACK: {e}")
                             return buffer
                         chunks_since_ack = 0
                         try:
@@ -1031,11 +1093,16 @@ class StudentClient(QWidget):
                         except:
                             pass
                     
+                    # Update progress UI
                     if time.time() - last_update >= 1.0:
                         progress = receiver.get_progress()
-                        self.signals.file_progress.emit(int(progress), f"{filename}: {progress:.0f}%")
+                        self.signals.file_progress.emit(
+                            int(progress), 
+                            f"{filename}: {progress:.0f}% ({chunks_received}/{total_chunks} chunks)"
+                        )
                         last_update = time.time()
                 
+                # Send final ACK if needed
                 if chunks_since_ack > 0:
                     try:
                         self.client_socket.sendall(b"CHUNK_OK\n")
@@ -1043,37 +1110,112 @@ class StudentClient(QWidget):
                         pass
             
             except Exception as e:
-                self.log(f"Transfer error: {e}")
+                self.log(f"❌ Transfer error: {e}")
+                import traceback
+                self.log(traceback.format_exc())
                 raise
             
+            # Write file to disk
             if receiver.is_complete():
-                self.log(f"Writing to disk...")
+                self.log(f"💾 Writing {total_chunks} chunks to disk...")
                 try:
                     with open(filepath, "wb") as f:
                         for i in range(total_chunks):
                             if i in chunk_data_map:
                                 f.write(chunk_data_map[i])
+                            else:
+                                self.log(f"⚠️ Missing chunk {i}")
                     
+                    # Send verification
                     try:
                         self.client_socket.sendall(b"VERIFIED\n")
+                        # Also send completion to help server
+                        self.client_socket.sendall(b"TRANSFER_COMPLETE\n")
                     except:
                         pass
                     
                     receiver.cleanup()
                     self.signals.file_progress.emit(100, f"Complete: {filename}")
                     self.log(f"✅ Saved: {filepath}")
-                    self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
+                    
+                    # FIXED: Handle restore extraction
+                    if destination == "RESTORE_TEMP":
+                        self.log(f"🔄 Starting restore extraction...")
+                        threading.Thread(
+                            target=self._extract_restore,
+                            args=(filepath,),
+                            daemon=True
+                        ).start()
+                    else:
+                        self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
+                    
                     QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
                 
                 except Exception as e:
-                    self.log(f"Write error: {e}")
+                    self.log(f"❌ Write error: {e}")
+                    import traceback
+                    self.log(traceback.format_exc())
                     raise
+            else:
+                self.log(f"⚠️ Transfer incomplete: {len(receiver.received_chunks)}/{total_chunks} chunks")
         
         except Exception as e:
-            self.log(f"Transfer error: {e}")
+            self.log(f"❌ Transfer error: {e}")
             self.signals.file_progress.emit(0, f"Error")
         
         return buffer
+    
+    def _extract_restore(self, zip_filepath):
+        """FIXED: Extract restore archive to proper location"""
+        try:
+            restore_dest = self.restore_destination or "C:\\Users\\Student\\Documents"
+            
+            self.log(f"📦 Extracting restore to: {restore_dest}")
+            self.signals.show_progress_dialog.emit("Restoring files...", 100)
+            
+            # Ensure destination exists
+            os.makedirs(restore_dest, exist_ok=True)
+            
+            # Extract zip
+            with zipfile.ZipFile(zip_filepath, 'r') as zip_ref:
+                file_list = zip_ref.namelist()
+                total_files = len(file_list)
+                
+                self.log(f"📊 Extracting {total_files} files...")
+                
+                for idx, file in enumerate(file_list):
+                    try:
+                        # Extract to destination
+                        zip_ref.extract(file, restore_dest)
+                    except Exception as e:
+                        self.log(f"⚠️ Failed to extract {file}: {e}")
+                    
+                    # Update progress
+                    if (idx + 1) % max(1, total_files // 20) == 0 or (idx + 1) == total_files:
+                        progress = int(((idx + 1) / total_files) * 100)
+                        self.signals.update_progress_dialog.emit(
+                            progress,
+                            f"Extracting files...\n{idx + 1} / {total_files}"
+                        )
+            
+            # Clean up
+            try:
+                os.remove(zip_filepath)
+            except:
+                pass
+            
+            self.signals.close_progress_dialog.emit()
+            self.log(f"✅ Restore complete: {total_files} files restored to {restore_dest}")
+            
+            QTimer.singleShot(500, lambda: self.signals.show_message.emit(
+                "Restore Complete",
+                f"Successfully restored {total_files} files to:\n{restore_dest}"
+            ))
+            
+        except Exception as e:
+            self.log(f"❌ Restore extraction failed: {e}")
+            self.signals.close_progress_dialog.emit()
+            self.signals.show_message.emit("Restore Error", f"Failed to extract files: {e}")
     
     def _resolve_destination_path(self, destination, filename):
         try:
@@ -1222,7 +1364,7 @@ class StudentClient(QWidget):
                 self.screen_sharing = False
     
     def handle_backup_request(self, source_path, move_files=False):
-        """FIXED: Use signals for progress dialog instead of creating in thread"""
+        """Backup handler with progress"""
         try:
             self.log(f"💾 Backup requested: {source_path}")
             
@@ -1232,10 +1374,8 @@ class StudentClient(QWidget):
                 self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
                 return
             
-            # Show progress dialog via signal
             self.signals.show_progress_dialog.emit("Preparing backup...", 100)
             
-            # Scan files
             self.signals.update_progress_dialog.emit(5, "Scanning files...")
             
             file_list = []
@@ -1253,13 +1393,11 @@ class StudentClient(QWidget):
             file_count = len(file_list)
             self.log(f"📊 Found {file_count} files ({format_bytes(total_size)})")
             
-            # Create temporary zip file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_zip = os.path.join(RESUME_METADATA_DIR, f"backup_{timestamp}.zip")
             
             self.signals.update_progress_dialog.emit(10, f"Creating backup archive...\n0 / {file_count} files")
             
-            # Create zip with progress
             with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 if os.path.isfile(source_path):
                     zipf.write(source_path, os.path.basename(source_path))
@@ -1283,24 +1421,20 @@ class StudentClient(QWidget):
             
             self.signals.update_progress_dialog.emit(65, "Reading backup file...")
             
-            # Read zip file
             with open(temp_zip, 'rb') as f:
                 zip_data = f.read()
             
             zip_size = len(zip_data)
             self.log(f"📦 Backup size: {format_bytes(zip_size)}")
             
-            # Send backup data with progress
             self.signals.update_progress_dialog.emit(
                 70,
                 f"Uploading backup...\n0% ({format_bytes(0)} / {format_bytes(zip_size)})"
             )
             
-            # Send header
             header = f"BACKUP_DATA:{zip_size}\n".encode("utf-8")
             self.client_socket.sendall(header)
             
-            # Send data in chunks with progress
             chunk_size = 1024 * 1024
             sent = 0
             while sent < zip_size:
@@ -1308,7 +1442,6 @@ class StudentClient(QWidget):
                 self.client_socket.sendall(chunk)
                 sent += len(chunk)
                 
-                # Update progress
                 upload_percent = int((sent / zip_size) * 100)
                 overall_percent = 70 + int(upload_percent * 0.30)
                 self.signals.update_progress_dialog.emit(
@@ -1318,7 +1451,6 @@ class StudentClient(QWidget):
             
             self.signals.update_progress_dialog.emit(100, "Backup complete!")
             
-            # Clean up
             try:
                 os.remove(temp_zip)
             except:
@@ -1326,7 +1458,6 @@ class StudentClient(QWidget):
             
             self.log(f"✅ Backup sent successfully ({format_bytes(zip_size)})")
             
-            # NEW: Delete files if MOVE mode
             if move_files:
                 self.signals.update_progress_dialog.emit(100, "Deleting original files...")
                 deleted_count = 0
@@ -1341,14 +1472,13 @@ class StudentClient(QWidget):
                         failed_count += 1
                         self.log(f"⚠️ Failed to delete: {os.path.basename(file_path)} ({e})")
                 
-                # Clean up empty directories
                 try:
                     if os.path.isdir(source_path):
                         for root, dirs, files in os.walk(source_path, topdown=False):
                             for dir_name in dirs:
                                 dir_path = os.path.join(root, dir_name)
                                 try:
-                                    if not os.listdir(dir_path):  # Empty directory
+                                    if not os.listdir(dir_path):
                                         os.rmdir(dir_path)
                                 except:
                                     pass
@@ -1357,7 +1487,6 @@ class StudentClient(QWidget):
                 
                 self.log(f"🗑️ MOVE completed: {deleted_count} files deleted, {failed_count} failed")
             
-            # Close progress dialog and show success message
             self.signals.close_progress_dialog.emit()
             
             mode_text = "moved (deleted)" if move_files else "backed up"

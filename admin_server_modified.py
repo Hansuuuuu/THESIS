@@ -43,11 +43,11 @@ LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 5001
 RECV_BUFFER = 65536
 MAX_IMAGE_SIZE = 200 * 1024 * 1024
-SOCKET_SEND_BUFFER = 16 * 1024 * 1024
-SOCKET_RECV_BUFFER = 16 * 1024 * 1024
-CHUNK_SIZE = 4 * 1024 * 1024
-BATCH_ACK_SIZE = 10
-CHUNK_SEND_DELAY = 0.001
+SOCKET_SEND_BUFFER = 32 * 1024 * 1024  # Increased
+SOCKET_RECV_BUFFER = 32 * 1024 * 1024  # Increased
+CHUNK_SIZE = 8 * 1024 * 1024  # Increased to 8MB chunks
+BATCH_ACK_SIZE = 20  # Increased from 10 to 20
+CHUNK_SEND_DELAY = 0.0001  # Reduced delay
 
 INBOX_DIR = os.path.join(os.path.expanduser("~"), "lab_inbox_admin")
 RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache")
@@ -621,12 +621,13 @@ class ResumableFileTransfer:
         self.basename = os.path.basename(filepath)
         self.transfer_id = transfer_id or self._generate_transfer_id()
         
-        if self.filesize > 1024 * 1024 * 1024:
-            self.chunk_size = 8 * 1024 * 1024
-        elif self.filesize > 100 * 1024 * 1024:
-            self.chunk_size = 4 * 1024 * 1024
+        # OPTIMIZED: Adaptive chunk sizes
+        if self.filesize > 1024 * 1024 * 1024:  # > 1GB
+            self.chunk_size = 16 * 1024 * 1024  # 16MB
+        elif self.filesize > 100 * 1024 * 1024:  # > 100MB
+            self.chunk_size = 8 * 1024 * 1024   # 8MB
         else:
-            self.chunk_size = 1 * 1024 * 1024
+            self.chunk_size = 4 * 1024 * 1024   # 4MB
         
         self.total_chunks = (self.filesize + self.chunk_size - 1) // self.chunk_size
         self.metadata_file = os.path.join(RESUME_METADATA_DIR, f"{self.transfer_id}.json")
@@ -759,53 +760,118 @@ class ClientHandler:
             return False
     
     def send_restore(self, pc_name, restore_path):
-        """Send backed up files to client - MODIFIED to match PC names"""
+        """FIXED: Send backed up files to client with proper path resolution"""
         try:
-            # Use custom backup directory if set
-            backup_dir = getattr(self.server, 'custom_backup_dir', BACKUP_DIR)
+            # FIXED: Always use BACKUP_DIR for restore, not custom_backup_dir
+            backup_dir = BACKUP_DIR
             
-            # Look for backup folder matching PC name
-            # First, try to find the most recent backup folder
-            backup_folders = [f for f in os.listdir(backup_dir) 
-                            if f.startswith("Backup_") and os.path.isdir(os.path.join(backup_dir, f))]
-            
-            if not backup_folders:
-                self.server.log(f"❌ No backup folders found")
+            # Check if backup directory exists
+            if not os.path.exists(backup_dir):
+                self.server.log(f"❌ Backup directory not found: {backup_dir}")
                 return False
             
+            # Find the most recent backup folder
+            try:
+                backup_folders = [f for f in os.listdir(backup_dir) 
+                                if f.startswith("Backup_") and os.path.isdir(os.path.join(backup_dir, f))]
+            except Exception as e:
+                self.server.log(f"❌ Error reading backup directory: {e}")
+                return False
+            
+            if not backup_folders:
+                self.server.log(f"❌ No backup folders found in {backup_dir}")
+                self.server.log(f"💡 Tip: Create a backup first before attempting restore")
+                return False
+            
+            # Sort and get latest backup
             backup_folders.sort(reverse=True)
             latest_backup = backup_folders[0]
+            latest_backup_path = os.path.join(backup_dir, latest_backup)
             
-            # Look for PC name folder inside
-            pc_folder = os.path.join(backup_dir, latest_backup, pc_name)
+            self.server.log(f"📦 Using backup: {latest_backup}")
+            
+            # Look for PC name folder
+            pc_folder = os.path.join(latest_backup_path, pc_name)
             
             if not os.path.exists(pc_folder):
                 self.server.log(f"❌ No backup found for PC: {pc_name}")
+                self.server.log(f"📋 Available PCs in {latest_backup}:")
+                try:
+                    available_pcs = [d for d in os.listdir(latest_backup_path) 
+                                   if os.path.isdir(os.path.join(latest_backup_path, d))]
+                    for pc in available_pcs:
+                        self.server.log(f"   - {pc}")
+                except:
+                    pass
                 return False
             
-            # Look for the files folder
+            # Look for files folder
             files_folder = os.path.join(pc_folder, "files")
             if not os.path.exists(files_folder):
                 self.server.log(f"❌ No files folder in backup for: {pc_name}")
+                self.server.log(f"💡 Backup structure may be corrupted")
                 return False
             
-            # Create temporary zip
+            # Count files to restore
+            file_count = sum(len(files) for _, _, files in os.walk(files_folder))
+            if file_count == 0:
+                self.server.log(f"⚠️ No files found in backup for: {pc_name}")
+                return False
+            
+            # FIXED: Create restore zip with proper structure
             temp_zip = os.path.join(RESUME_METADATA_DIR, f"restore_{pc_name}_{int(time.time())}.zip")
             
-            self.server.log(f"📦 Creating restore package for {pc_name}...")
-            with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(files_folder):
-                    for file in files:
-                        file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, files_folder)
-                        zipf.write(file_path, arcname)
+            self.server.log(f"📦 Creating restore package for {pc_name} ({file_count} files)...")
             
-            # Send restore command with path
+            try:
+                with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zipf:
+                    files_added = 0
+                    for root, dirs, files in os.walk(files_folder):
+                        for file in files:
+                            file_path = os.path.join(root, file)
+                            # FIXED: Preserve relative path structure
+                            arcname = os.path.relpath(file_path, files_folder)
+                            try:
+                                zipf.write(file_path, arcname)
+                                files_added += 1
+                                if files_added % 100 == 0:
+                                    self.server.log(f"📊 Packaged {files_added}/{file_count} files...")
+                            except Exception as e:
+                                self.server.log(f"⚠️ Skipped {file}: {e}")
+                
+                if files_added == 0:
+                    self.server.log(f"❌ No files could be added to restore package")
+                    try:
+                        os.remove(temp_zip)
+                    except:
+                        pass
+                    return False
+                
+            except Exception as e:
+                self.server.log(f"❌ Error creating restore package: {e}")
+                try:
+                    os.remove(temp_zip)
+                except:
+                    pass
+                return False
+            
+            zip_size = os.path.getsize(temp_zip)
+            self.server.log(f"📦 Restore package created: {format_bytes(zip_size)}")
+            
+            # Send restore start command
             cmd = f"RESTORE_START:{restore_path}"
-            self.send_command(cmd)
+            if not self.send_command(cmd):
+                self.server.log(f"❌ Failed to send restore command to {pc_name}")
+                try:
+                    os.remove(temp_zip)
+                except:
+                    pass
+                return False
+            
             time.sleep(0.5)
             
-            # Send the zip file
+            # Send the zip file using optimized transfer
+            self.server.log(f"📤 Sending restore package to {pc_name}...")
             success = self.send_file_resumable(temp_zip, "RESTORE_TEMP")
             
             # Clean up temp zip
@@ -814,13 +880,21 @@ class ClientHandler:
             except:
                 pass
             
+            if success:
+                self.server.log(f"✅ Restore completed for {pc_name}")
+            else:
+                self.server.log(f"❌ Restore transfer failed for {pc_name}")
+            
             return success
+            
         except Exception as e:
             self.server.log(f"❌ Restore error: {e}")
+            import traceback
+            self.server.log(traceback.format_exc())
             return False
     
     def send_file_resumable(self, filepath, destination=None):
-        """FIXED: Unified resumable file transfer with proper protocol"""
+        """OPTIMIZED: Faster resumable file transfer"""
         if not os.path.exists(filepath):
             self.server.log(f"❌ File not found: {filepath}")
             return False
@@ -843,7 +917,7 @@ class ClientHandler:
             if len(pending_chunks) < transfer.total_chunks:
                 self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} done")
             
-            # Configure socket
+            # OPTIMIZED: Configure socket for maximum throughput
             try:
                 self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
@@ -873,49 +947,76 @@ class ClientHandler:
                     self.server.log(f"❌ Cannot start transfer")
                     return False
                 
-                # Wait for READY confirmation
-                self.sock.settimeout(15.0)
+                # FIXED: Simpler READY waiting - break immediately on READY
+                self.sock.settimeout(2.0)  # Short timeout for each recv
                 buffer = b""
                 ready_received = False
                 start_wait = time.time()
                 
-                while not ready_received and (time.time() - start_wait) < 15:
+                self.server.log(f"⏳ Waiting for client READY...")
+                
+                while not ready_received:
+                    # Check overall timeout
+                    if (time.time() - start_wait) >= 30:
+                        self.server.log(f"❌ Timeout waiting for READY after 30 seconds")
+                        self.server.log(f"💡 Last buffer content: {buffer[:100]}")
+                        raise Exception("Timeout waiting for READY")
+                    
                     try:
                         chunk = self.sock.recv(1024)
+                        if not chunk:
+                            self.server.log(f"❌ Connection closed while waiting for READY")
+                            raise Exception("Connection closed waiting for READY")
+                        buffer += chunk
                     except socket.timeout:
+                        # Just continue waiting
                         continue
-                    except OSError:
-                        self.server.log(f"⚠️ Socket closed waiting for READY")
+                    except OSError as e:
+                        self.server.log(f"⚠️ Socket error waiting for READY: {e}")
                         return False
                     
-                    if not chunk:
-                        raise Exception("Connection closed waiting for READY")
-                    
-                    buffer += chunk
+                    # Process lines in buffer
                     while b'\n' in buffer:
                         line, buffer = buffer.split(b'\n', 1)
                         msg = line.decode('utf-8', errors='ignore').strip()
                         
-                        if msg == "READY":
-                            ready_received = True
-                            break
-                        elif msg == "HEARTBEAT":
+                        if not msg:
                             continue
-                        elif msg == "ERROR":
-                            raise Exception("Client error during handshake")
+                        
+                        # Log the message
+                        self.server.log(f"📝 {self.key}: {msg}")
+                        
+                        # Check if it's READY
+                        if msg.upper() == "READY":
+                            ready_received = True
+                            self.server.log("✅ READY received - breaking wait loop")
+                            break  # Break out of inner while loop
+                        elif msg.upper() == "HEARTBEAT":
+                            # Ignore heartbeats during handshake
+                            continue
+                        elif msg.upper().startswith("ERROR"):
+                            error_detail = msg.split(":", 1)[1] if ":" in msg else "Unknown"
+                            self.server.log(f"❌ Client error: {error_detail}")
+                            raise Exception(f"Client error: {error_detail}")
+                    
+                    # Check again if READY was received (in case we broke from inner loop)
+                    if ready_received:
+                        break  # Break out of outer while loop
                 
+                # Double check we actually got READY
                 if not ready_received:
-                    raise Exception("Timeout waiting for READY")
+                    self.server.log(f"❌ READY not received")
+                    raise Exception("READY not received")
                 
-                self.server.log("✅ Client READY - Starting transfer")
+                self.server.log("✅ Client READY confirmed - Starting chunk transfer")
                 self.sock.settimeout(None)
                 
-                # Transfer chunks
+                # OPTIMIZED: Transfer chunks with reduced delays
                 start_time = time.time()
                 sent_bytes = 0
                 last_log = start_time
                 chunks_in_batch = []
-                chunk_delay = CHUNK_SEND_DELAY
+                chunk_delay = CHUNK_SEND_DELAY  # Minimal delay
                 
                 with open(filepath, "rb") as f:
                     for idx, chunk_index in enumerate(pending_chunks):
@@ -933,7 +1034,7 @@ class ClientHandler:
                             # Calculate checksum
                             checksum = transfer._calculate_chunk_checksum(chunk_data)
                             
-                            # Prepare chunk header (index + size + checksum)
+                            # Prepare chunk header
                             chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
                             chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
                             
@@ -945,7 +1046,10 @@ class ClientHandler:
                                 transfer.save_progress_batch()
                                 return False
                             
-                            time.sleep(chunk_delay)
+                            # OPTIMIZED: Minimal delay
+                            if chunk_delay > 0:
+                                time.sleep(chunk_delay)
+                            
                             sent_bytes += len(chunk_data)
                             chunks_in_batch.append((chunk_index, checksum))
                             
@@ -1416,7 +1520,7 @@ class AdminServer:
     
     # MODIFIED: Restore files to specific clients with auto-distribution
     def restore_to_clients(self, client_keys, restore_path, backup_folders=None):
-        """Restore backed up files to selected clients - with auto PC name matching"""
+        """FIXED: Restore backed up files to selected clients"""
         success_count = 0
         
         with self.clients_lock:
@@ -1425,13 +1529,15 @@ class AdminServer:
                     handler = self.clients[key]
                     hostname = handler.client_info.get("hostname", key.replace(":", "_"))
                     
-                    # Check if we have a backup for this PC name
                     if backup_folders and hostname not in backup_folders:
                         self.log(f"⚠️ No backup found for {hostname}, skipping")
                         continue
                     
                     if handler.send_restore(hostname, restore_path):
                         success_count += 1
+                    else:
+                        self.log(f"❌ Restore failed for {hostname}")
+        
         return success_count
     
     def start_presentation(self, target_keys):
@@ -2197,26 +2303,25 @@ class AdminWindow(QMainWindow):
             QMessageBox.warning(self, "No Selection", "Select one or more clients")
             return
         
-        msg, ok = QInputDialog.getText(
+        text, ok = QInputDialog.getText(
             self, "Send Message",
-            "Enter message to send:",
-            QLineEdit.Normal
+            "Enter message to send:"
         )
         
-        if ok and msg:
-            cmd = f"MSG:{msg}"
-            self.send_to_selected(cmd)
+        if ok and text:
+            with self.server.clients_lock:
+                for k in keys:
+                    if k in self.server.clients:
+                        self.server.clients[k].send_command(f"MESSAGE:{text}")
     
     def broadcast_message(self):
-        msg, ok = QInputDialog.getText(
+        text, ok = QInputDialog.getText(
             self, "Broadcast Message",
-            "Enter message to broadcast to all clients:",
-            QLineEdit.Normal
+            "Enter message to broadcast:"
         )
         
-        if ok and msg:
-            cmd = f"MSG:{msg}"
-            self.server.broadcast_command(cmd)
+        if ok and text:
+            self.server.broadcast_command(f"MESSAGE:{text}")
     
     # MODIFIED: New backup with configuration dialog
     def backup_client_files(self):
