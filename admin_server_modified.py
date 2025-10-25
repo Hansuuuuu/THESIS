@@ -1,6 +1,12 @@
 """
-Lab Manager - Admin Server - COMPLETE VERSION
-All features working: Lock/Unlock, Screen Monitoring, File Transfer, Presentation Mode
+Lab Manager - Admin Server - MODIFIED VERSION
+Changes:
+- Backup now MOVES files from client (deletes after backup)
+- Better backup UI with templates and PC name organization
+- Restore with selectable client destination
+- Auto-distribution based on PC names
+- Right-click context menu on client list
+- PC icons in client list
 """
 
 import shutil
@@ -25,10 +31,11 @@ import numpy as np
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QListWidget, QFileDialog, QMessageBox,
-    QTextEdit, QTabWidget, QGroupBox, QComboBox, QInputDialog, QLineEdit
+    QTextEdit, QTabWidget, QGroupBox, QComboBox, QInputDialog, QLineEdit,
+    QDialog, QCheckBox, QRadioButton, QButtonGroup,QMenu
 )
-from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
-from PyQt5.QtGui import QPixmap, QImage, QFont
+from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, QPoint
+from PyQt5.QtGui import QPixmap, QImage, QFont, QIcon, QCursor
 from PyQt5.QtCore import QByteArray
 
 # Configuration
@@ -46,7 +53,8 @@ INBOX_DIR = os.path.join(os.path.expanduser("~"), "lab_inbox_admin")
 RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache")
 os.makedirs(INBOX_DIR, exist_ok=True)
 os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
-BACKUP_DIR = os.path.join(os.path.expanduser("~"), "ClientBackups")  # NEW: Main backup directory
+BACKUP_DIR = os.path.join(os.path.expanduser("~"), "ClientBackups")
+os.makedirs(BACKUP_DIR, exist_ok=True)
 
 PRESENTATION_FPS = 30
 PRESENTATION_QUALITY = 85
@@ -67,8 +75,395 @@ def format_bytes(size):
 
 class ServerSignals(QObject):
     new_frame = pyqtSignal(str, bytes)
+
+
+# NEW: Backup Configuration Dialog
+class BackupConfigDialog(QDialog):
+    def __init__(self, parent=None, selected_clients=None):
+        super().__init__(parent)
+        self.setWindowTitle("Backup Configuration")
+        self.resize(600, 500)
+        self.selected_clients = selected_clients or []
+        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QGroupBox {
+                border: 1px solid #3c3c3c;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+                color: #4EC9B0;
+            }
+            QLineEdit, QTextEdit {
+                background-color: #252526;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 5px;
+                color: #e0e0e0;
+            }
+            QLabel {
+                color: #e0e0e0;
+            }
+            QRadioButton {
+                color: #e0e0e0;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        
+        # Header
+        header = QLabel("📦 Backup Configuration Wizard")
+        header.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        header.setStyleSheet("color: #0078d4; padding: 10px;")
+        layout.addWidget(header)
+        
+        # Client info
+        info_label = QLabel(f"Selected Clients: {len(self.selected_clients)}")
+        info_label.setStyleSheet("color: #4EC9B0; font-weight: bold;")
+        layout.addWidget(info_label)
+        
+        # Source Path Selection
+        source_group = QGroupBox("📁 Source Path (on clients)")
+        source_layout = QVBoxLayout(source_group)
+        
+        # Template buttons
+        template_label = QLabel("Quick Templates:")
+        source_layout.addWidget(template_label)
+        
+        template_btn_layout = QHBoxLayout()
+        
+        templates = [
+            ("📄 Documents", "C:\\Users\\Student\\Documents"),
+            ("🖼️ Desktop", "C:\\Users\\Student\\Desktop"),
+            ("📥 Downloads", "C:\\Users\\Student\\Downloads"),
+            ("📁 User Folder", "C:\\Users\\Student")
+        ]
+        
+        for label, path in templates:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda checked, p=path: self.txt_source.setText(p))
+            template_btn_layout.addWidget(btn)
+        
+        source_layout.addLayout(template_btn_layout)
+        
+        path_layout = QHBoxLayout()
+        path_layout.addWidget(QLabel("Custom Path:"))
+        self.txt_source = QLineEdit()
+        self.txt_source.setPlaceholderText("e.g., C:\\Users\\Student\\Documents")
+        self.txt_source.setText("C:\\Users\\Student\\Documents")
+        path_layout.addWidget(self.txt_source)
+        source_layout.addLayout(path_layout)
+        
+        layout.addWidget(source_group)
+        
+        # Backup Options
+        options_group = QGroupBox("⚙️ Backup Options")
+        options_layout = QVBoxLayout(options_group)
+        
+        self.chk_move = QCheckBox("🔄 MOVE files (delete from client after backup)")
+        self.chk_move.setChecked(True)  # Default to MOVE
+        self.chk_move.setStyleSheet("color: #ff6b6b; font-weight: bold;")
+        options_layout.addWidget(self.chk_move)
+        
+        warning_label = QLabel("⚠️ Warning: MOVE will permanently delete files from the client!")
+        warning_label.setStyleSheet("color: #ff6b6b; font-style: italic;")
+        options_layout.addWidget(warning_label)
+        
+        layout.addWidget(options_group)
+        
+        # Destination Selection
+        dest_group = QGroupBox("💾 Backup Destination (on this PC)")
+        dest_layout = QVBoxLayout(dest_group)
+        
+        dest_path_layout = QHBoxLayout()
+        dest_path_layout.addWidget(QLabel("Destination:"))
+        self.txt_destination = QLineEdit()
+        self.txt_destination.setText(BACKUP_DIR)
+        self.txt_destination.setReadOnly(True)
+        dest_path_layout.addWidget(self.txt_destination)
+        
+        btn_browse_dest = QPushButton("Browse...")
+        btn_browse_dest.clicked.connect(self._browse_destination)
+        dest_path_layout.addWidget(btn_browse_dest)
+        
+        dest_layout.addLayout(dest_path_layout)
+        
+        dest_note = QLabel("📋 Files will be organized in folders named by PC name")
+        dest_note.setStyleSheet("color: #4EC9B0; font-style: italic;")
+        dest_layout.addWidget(dest_note)
+        
+        layout.addWidget(dest_group)
+        
+        # Summary
+        summary_group = QGroupBox("📊 Summary")
+        summary_layout = QVBoxLayout(summary_group)
+        self.lbl_summary = QLabel()
+        self.lbl_summary.setWordWrap(True)
+        summary_layout.addWidget(self.lbl_summary)
+        layout.addWidget(summary_group)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_cancel)
+        
+        btn_ok = QPushButton("✅ Start Backup")
+        btn_ok.clicked.connect(self.accept)
+        btn_ok.setStyleSheet("background-color: #107c10;")
+        btn_layout.addWidget(btn_ok)
+        
+        layout.addLayout(btn_layout)
+        
+        # Connect signals
+        self.txt_source.textChanged.connect(self._update_summary)
+        self.txt_destination.textChanged.connect(self._update_summary)
+        self.chk_move.stateChanged.connect(self._update_summary)
+        
+        self._update_summary()
     
+    def _browse_destination(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Select Backup Destination Folder",
+            self.txt_destination.text()
+        )
+        if folder:
+            self.txt_destination.setText(folder)
     
+    def _update_summary(self):
+        source = self.txt_source.text()
+        dest = self.txt_destination.text()
+        move_mode = self.chk_move.isChecked()
+        
+        mode_text = "MOVE (delete from client)" if move_mode else "COPY (keep on client)"
+        
+        summary = f"""
+<b>Source Path:</b> {source}<br>
+<b>Destination:</b> {dest}<br>
+<b>Mode:</b> <span style='color: {'#ff6b6b' if move_mode else '#4EC9B0'};'>{mode_text}</span><br>
+<b>Clients:</b> {len(self.selected_clients)}<br>
+<br>
+<b>Organization:</b> Each client's files will be saved in a folder named after their PC name.
+        """
+        
+        self.lbl_summary.setText(summary)
+    
+    def get_config(self):
+        return {
+            'source_path': self.txt_source.text(),
+            'destination': self.txt_destination.text(),
+            'move_files': self.chk_move.isChecked()
+        }
+
+
+# NEW: Restore Configuration Dialog
+class RestoreConfigDialog(QDialog):
+    def __init__(self, parent=None, selected_clients=None):
+        super().__init__(parent)
+        self.setWindowTitle("Restore Configuration")
+        self.resize(600, 500)
+        self.selected_clients = selected_clients or []
+        self.backup_folders = {}
+        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QGroupBox {
+                border: 1px solid #3c3c3c;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+                color: #4EC9B0;
+            }
+            QLineEdit {
+                background-color: #252526;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 5px;
+                color: #e0e0e0;
+            }
+            QLabel {
+                color: #e0e0e0;
+            }
+            QRadioButton {
+                color: #e0e0e0;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        
+        # Header
+        header = QLabel("📥 Restore Configuration Wizard")
+        header.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        header.setStyleSheet("color: #107c10; padding: 10px;")
+        layout.addWidget(header)
+        
+        # Client info
+        info_label = QLabel(f"Selected Clients: {len(self.selected_clients)}")
+        info_label.setStyleSheet("color: #4EC9B0; font-weight: bold;")
+        layout.addWidget(info_label)
+        
+        # Backup source selection
+        source_group = QGroupBox("📦 Backup Source")
+        source_layout = QVBoxLayout(source_group)
+        
+        btn_scan = QPushButton("🔍 Scan for Backups")
+        btn_scan.clicked.connect(self._scan_backups)
+        source_layout.addWidget(btn_scan)
+        
+        self.lbl_scan_result = QLabel("Click 'Scan for Backups' to find available backup folders")
+        self.lbl_scan_result.setWordWrap(True)
+        self.lbl_scan_result.setStyleSheet("color: #4EC9B0; font-style: italic;")
+        source_layout.addWidget(self.lbl_scan_result)
+        
+        layout.addWidget(source_group)
+        
+        # Restore destination
+        dest_group = QGroupBox("📁 Restore Destination (on clients)")
+        dest_layout = QVBoxLayout(dest_group)
+        
+        template_label = QLabel("Quick Templates:")
+        dest_layout.addWidget(template_label)
+        
+        template_btn_layout = QHBoxLayout()
+        templates = [
+            ("📄 Documents", "C:\\Users\\Student\\Documents"),
+            ("🖼️ Desktop", "C:\\Users\\Student\\Desktop"),
+            ("📥 Downloads", "C:\\Users\\Student\\Downloads"),
+        ]
+        
+        for label, path in templates:
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda checked, p=path: self.txt_restore_dest.setText(p))
+            template_btn_layout.addWidget(btn)
+        
+        dest_layout.addLayout(template_btn_layout)
+        
+        dest_path_layout = QHBoxLayout()
+        dest_path_layout.addWidget(QLabel("Custom Path:"))
+        self.txt_restore_dest = QLineEdit()
+        self.txt_restore_dest.setText("C:\\Users\\Student\\Documents")
+        dest_path_layout.addWidget(self.txt_restore_dest)
+        
+        dest_layout.addLayout(dest_path_layout)
+        
+        layout.addWidget(dest_group)
+        
+        # Summary
+        summary_group = QGroupBox("📊 Summary")
+        summary_layout = QVBoxLayout(summary_group)
+        self.lbl_summary = QLabel("Configure restore options above")
+        self.lbl_summary.setWordWrap(True)
+        summary_layout.addWidget(self.lbl_summary)
+        layout.addWidget(summary_group)
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_cancel)
+        
+        btn_ok = QPushButton("✅ Start Restore")
+        btn_ok.clicked.connect(self.accept)
+        btn_ok.setStyleSheet("background-color: #107c10;")
+        btn_layout.addWidget(btn_ok)
+        
+        layout.addLayout(btn_layout)
+    
+    def _scan_backups(self):
+        """Scan BACKUP_DIR for PC name folders and match with selected clients"""
+        if not os.path.exists(BACKUP_DIR):
+            self.lbl_scan_result.setText("❌ Backup directory not found!")
+            return
+        
+        # Get all subdirectories in BACKUP_DIR
+        backup_subfolders = [f for f in os.listdir(BACKUP_DIR) 
+                            if os.path.isdir(os.path.join(BACKUP_DIR, f))]
+        
+        # Look for Backup_* folders
+        backup_dated_folders = [f for f in backup_subfolders if f.startswith("Backup_")]
+        
+        if not backup_dated_folders:
+            self.lbl_scan_result.setText("❌ No backup folders found!")
+            return
+        
+        # Find the most recent backup folder
+        backup_dated_folders.sort(reverse=True)
+        latest_backup = backup_dated_folders[0]
+        latest_backup_path = os.path.join(BACKUP_DIR, latest_backup)
+        
+        # Scan for PC name folders inside the latest backup
+        pc_folders = {}
+        for item in os.listdir(latest_backup_path):
+            item_path = os.path.join(latest_backup_path, item)
+            if os.path.isdir(item_path):
+                # Check if this folder contains backup files
+                files_folder = os.path.join(item_path, "files")
+                if os.path.exists(files_folder):
+                    pc_folders[item] = files_folder
+        
+        if not pc_folders:
+            self.lbl_scan_result.setText(f"❌ No PC backups found in {latest_backup}")
+            return
+        
+        # Match with selected clients
+        self.backup_folders = pc_folders
+        matched = 0
+        for client in self.selected_clients:
+            if client in pc_folders:
+                matched += 1
+        
+        result_text = f"""
+<b>✅ Found {len(pc_folders)} PC backup(s) in:</b><br>
+{latest_backup}<br><br>
+<b>PC Names:</b> {', '.join(pc_folders.keys())}<br><br>
+<b>Matched Clients:</b> {matched} / {len(self.selected_clients)}<br><br>
+<span style='color: #4EC9B0;'>✓ Files will be automatically distributed to matching PC names</span>
+        """
+        
+        self.lbl_scan_result.setText(result_text)
+    
+    def get_config(self):
+        return {
+            'restore_destination': self.txt_restore_dest.text(),
+            'backup_folders': self.backup_folders
+        }
+
+
 class FileSyncManager:
     """Automatically syncs files from all connected clients"""
     
@@ -352,266 +747,57 @@ class ClientHandler:
             self.server.log(f"❌ Send error to {self.key}: {e}")
             return False
     
-    # def send_file_resumable(self, filepath, destination=None):
-    #     if not os.path.exists(filepath):
-    #         self.server.log(f"❌ File not found: {filepath}")
-    #         return False
-        
-    #     if not self.sock or not self.running.is_set():
-    #         self.server.log(f"⚠️ Client {self.key} not connected")
-    #         return False
-        
-    #     self.transferring.set()
-        
-    #     try:
-    #         transfer = ResumableFileTransfer(filepath, destination or "Downloads")
-    #         basename = transfer.basename
-    #         filesize = transfer.filesize
-    #         chunk_size = transfer.chunk_size
-            
-    #         self.server.log(f"📤 Starting: {basename} ({format_bytes(filesize)})")
-            
-    #         pending_chunks = transfer.get_pending_chunks()
-    #         if len(pending_chunks) < transfer.total_chunks:
-    #             self.server.log(f"🔄 Resume: {len(transfer.completed_chunks)}/{transfer.total_chunks} done")
-            
-    #         try:
-    #             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    #             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
-    #             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECV_BUFFER)
-    #         except:
-    #             pass
-            
-    #         init_header = {
-    #             "command": "RESUMABLE_TRANSFER_START",
-    #             "transfer_id": transfer.transfer_id,
-    #             "filename": basename,
-    #             "destination": transfer.destination,
-    #             "filesize": filesize,
-    #             "total_chunks": transfer.total_chunks,
-    #             "chunk_size": chunk_size,
-    #             "batch_ack_size": BATCH_ACK_SIZE
-    #         }
-            
-    #         init_json = json.dumps(init_header).encode("utf-8")
-    #         header = b"RESUMABLE_FILE\n" + struct.pack(">I", len(init_json)) + init_json
-            
-    #         with self.lock:
-    #             try:
-    #                 self.sock.sendall(header)
-    #             except OSError:
-    #                 self.server.log(f"❌ Cannot start transfer")
-    #                 return False
-                
-    #             self.sock.settimeout(15.0)
-    #             buffer = b""
-    #             ready_received = False
-    #             start_wait = time.time()
-                
-    #             while not ready_received and (time.time() - start_wait) < 15:
-    #                 try:
-    #                     chunk = self.sock.recv(1024)
-    #                 except socket.timeout:
-    #                     continue
-    #                 except OSError:
-    #                     self.server.log(f"⚠️ Socket closed waiting for READY")
-    #                     return False
-                    
-    #                 if not chunk:
-    #                     raise Exception("Connection closed waiting for READY")
-                    
-    #                 buffer += chunk
-    #                 while b'\n' in buffer:
-    #                     line, buffer = buffer.split(b'\n', 1)
-    #                     msg = line.decode('utf-8', errors='ignore').strip()
-                        
-    #                     if msg == "READY":
-    #                         ready_received = True
-    #                         break
-    #                     elif msg == "HEARTBEAT":
-    #                         continue
-    #                     elif msg == "ERROR":
-    #                         raise Exception("Client error during handshake")
-                
-    #             if not ready_received:
-    #                 raise Exception("Timeout waiting for READY")
-                
-    #             self.server.log("✅ Client READY - Starting transfer")
-    #             self.sock.settimeout(None)
-                
-    #             start_time = time.time()
-    #             sent_bytes = 0
-    #             last_log = start_time
-    #             chunks_in_batch = []
-    #             chunk_delay = CHUNK_SEND_DELAY
-                
-    #             with open(filepath, "rb") as f:
-    #                 for idx, chunk_index in enumerate(pending_chunks):
-    #                     if not self.running.is_set():
-    #                         self.server.log(f"⚠️ Transfer stopped")
-    #                         break
-                        
-    #                     try:
-    #                         f.seek(chunk_index * chunk_size)
-    #                         chunk_data = f.read(chunk_size)
-    #                         if not chunk_data:
-    #                             break
-                            
-    #                         checksum = transfer._calculate_chunk_checksum(chunk_data)
-    #                         chunk_header = struct.pack(">II", chunk_index, len(chunk_data))
-    #                         chunk_header += checksum.encode('utf-8').ljust(64, b'\x00')
-                            
-    #                         try:
-    #                             self.sock.sendall(chunk_header + chunk_data)
-    #                         except OSError:
-    #                             self.server.log(f"⚠️ Socket closed during chunk {chunk_index}")
-    #                             transfer.save_progress_batch()
-    #                             return False
-                            
-    #                         time.sleep(chunk_delay)
-    #                         sent_bytes += len(chunk_data)
-    #                         chunks_in_batch.append((chunk_index, checksum))
-                            
-    #                         if len(chunks_in_batch) >= BATCH_ACK_SIZE or idx == len(pending_chunks) - 1:
-    #                             self.sock.settimeout(30.0)
-    #                             ack_buffer = b""
-    #                             ack_received = False
-    #                             ack_start = time.time()
-                                
-    #                             while not ack_received and (time.time() - ack_start) < 30:
-    #                                 try:
-    #                                     chunk_ack = self.sock.recv(4096)
-    #                                 except socket.timeout:
-    #                                     continue
-    #                                 except OSError:
-    #                                     self.server.log(f"⚠️ Socket closed waiting for ACK")
-    #                                     transfer.save_progress_batch()
-    #                                     return False
-                                    
-    #                                 if not chunk_ack:
-    #                                     raise Exception("Connection closed during ACK")
-                                    
-    #                                 ack_buffer += chunk_ack
-    #                                 while b'\n' in ack_buffer:
-    #                                     line, ack_buffer = ack_buffer.split(b'\n', 1)
-    #                                     msg = line.decode('utf-8', errors='ignore').strip().upper()
-                                        
-    #                                     if msg == "CHUNK_OK":
-    #                                         ack_received = True
-    #                                         break
-    #                                     elif msg == "HEARTBEAT":
-    #                                         continue
-    #                                     elif msg in ["CHUNK_ERROR", "ERROR"]:
-    #                                         raise Exception(f"Client error at chunk {chunk_index}")
-                                
-    #                             if not ack_received:
-    #                                 raise Exception(f"Timeout waiting for ACK at chunk {chunk_index}")
-                                
-    #                             self.sock.settimeout(None)
-                                
-    #                             for ci, cs in chunks_in_batch:
-    #                                 transfer.mark_chunk_complete(ci, cs)
-    #                             chunks_in_batch = []
-    #                             if idx % 50 == 0:
-    #                                 transfer.save_progress_batch()
-                            
-    #                         current_time = time.time()
-    #                         if current_time - last_log >= 2.0:
-    #                             progress = transfer.get_progress()
-    #                             elapsed = current_time - start_time
-    #                             speed = sent_bytes / elapsed if elapsed > 0 else 0
-    #                             eta = ((filesize - sent_bytes) / speed) if speed > 0 else 0
-    #                             self.server.log(
-    #                                 f"📊 {progress:.1f}% | {format_bytes(speed)}/s | "
-    #                                 f"ETA: {int(eta)}s"
-    #                             )
-    #                             last_log = current_time
-    #                             sent_bytes = 0
-                        
-    #                     except Exception as e:
-    #                         self.server.log(f"❌ Chunk {chunk_index} error: {e}")
-    #                         raise
-                
-    #             try:
-    #                 self.sock.sendall(b"TRANSFER_COMPLETE\n")
-    #                 self.server.log("✅ All chunks sent, waiting for VERIFIED")
-    #             except OSError:
-    #                 self.server.log(f"⚠️ Socket closed before TRANSFER_COMPLETE")
-    #                 transfer.save_progress_batch()
-    #                 return False
-                
-    #             self.sock.settimeout(60.0)
-    #             try:
-    #                 verify_buffer = b""
-    #                 verify_start = time.time()
-                    
-    #                 while (time.time() - verify_start) < 60:
-    #                     try:
-    #                         final_ack = self.sock.recv(4096)
-    #                         if not final_ack:
-    #                             raise ConnectionError("Connection closed waiting for VERIFIED")
-                            
-    #                         verify_buffer += final_ack
-                            
-    #                         if b"VERIFIED" in verify_buffer:
-    #                             self.server.log("✅ Client verified transfer")
-    #                             break
-    #                         elif b"HEARTBEAT" in verify_buffer:
-    #                             verify_buffer = b""
-    #                             continue
-                        
-    #                     except socket.timeout:
-    #                         continue
-    #                 else:
-    #                     self.server.log("⚠️ Timeout waiting for VERIFIED")
-                
-    #             except OSError:
-    #                 self.server.log("⚠️ Socket closed before VERIFIED")
-    #             finally:
-    #                 self.sock.settimeout(None)
-            
-    #         elapsed = time.time() - start_time
-    #         speed = filesize / elapsed if elapsed > 0 else 0
-    #         self.server.log(f"✅ Complete: {basename} | {format_bytes(speed)}/s | {int(elapsed)}s")
-            
-    #         transfer.cleanup()
-    #         return True
-        
-    #     except Exception as e:
-    #         self.server.log(f"❌ Transfer error: {e}")
-    #         self.server.log("💾 Progress saved - can resume")
-    #         return False
-        
-    #     finally:
-    #         self.transferring.clear()
-            
-            
-    # NEW: Request backup from client
-    def request_backup(self, source_path):
-        """Request client to backup a directory"""
+    def request_backup(self, source_path, move_files=False):
+        """Request backup from client - MODIFIED to support MOVE"""
         try:
-            cmd = f"BACKUP_REQUEST:{source_path}"
+            # NEW: Add MOVE flag to backup command
+            mode = "MOVE" if move_files else "COPY"
+            cmd = f"BACKUP:{mode}:{source_path}"
             return self.send_command(cmd)
         except Exception as e:
             self.server.log(f"❌ Backup request error: {e}")
             return False
     
-    # NEW: Send restore files to client
-    def send_restore(self, client_name, restore_path):
-        """Send backup files back to client"""
+    def send_restore(self, pc_name, restore_path):
+        """Send backed up files to client - MODIFIED to match PC names"""
         try:
-            backup_folder = os.path.join(BACKUP_DIR, client_name)
-            if not os.path.exists(backup_folder):
-                self.server.log(f"❌ No backup found for {client_name}")
+            # Use custom backup directory if set
+            backup_dir = getattr(self.server, 'custom_backup_dir', BACKUP_DIR)
+            
+            # Look for backup folder matching PC name
+            # First, try to find the most recent backup folder
+            backup_folders = [f for f in os.listdir(backup_dir) 
+                            if f.startswith("Backup_") and os.path.isdir(os.path.join(backup_dir, f))]
+            
+            if not backup_folders:
+                self.server.log(f"❌ No backup folders found")
                 return False
             
-            # Create a temporary zip file
-            temp_zip = os.path.join(BACKUP_DIR, f"restore_{client_name}_{int(time.time())}.zip")
+            backup_folders.sort(reverse=True)
+            latest_backup = backup_folders[0]
+            
+            # Look for PC name folder inside
+            pc_folder = os.path.join(backup_dir, latest_backup, pc_name)
+            
+            if not os.path.exists(pc_folder):
+                self.server.log(f"❌ No backup found for PC: {pc_name}")
+                return False
+            
+            # Look for the files folder
+            files_folder = os.path.join(pc_folder, "files")
+            if not os.path.exists(files_folder):
+                self.server.log(f"❌ No files folder in backup for: {pc_name}")
+                return False
+            
+            # Create temporary zip
+            temp_zip = os.path.join(RESUME_METADATA_DIR, f"restore_{pc_name}_{int(time.time())}.zip")
+            
+            self.server.log(f"📦 Creating restore package for {pc_name}...")
             with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
-                for root, dirs, files in os.walk(backup_folder):
+                for root, dirs, files in os.walk(files_folder):
                     for file in files:
                         file_path = os.path.join(root, file)
-                        arcname = os.path.relpath(file_path, backup_folder)
+                        arcname = os.path.relpath(file_path, files_folder)
                         zipf.write(file_path, arcname)
             
             # Send restore command with path
@@ -799,270 +985,252 @@ class ClientHandler:
                                 if not ack_received:
                                     raise Exception(f"Timeout waiting for ACK at chunk {chunk_index}")
                                 
-                                self.sock.settimeout(None)
-                                
                                 # Mark chunks as complete
-                                for ci, cs in chunks_in_batch:
-                                    transfer.mark_chunk_complete(ci, cs)
+                                for c_idx, c_sum in chunks_in_batch:
+                                    transfer.mark_chunk_complete(c_idx, c_sum)
+                                
+                                transfer.save_progress_batch()
                                 chunks_in_batch = []
                                 
-                                # Save progress periodically
-                                if idx % 50 == 0:
-                                    transfer.save_progress_batch()
-                            
-                            # Log progress
-                            current_time = time.time()
-                            if current_time - last_log >= 2.0:
+                                # Log progress
                                 progress = transfer.get_progress()
-                                elapsed = current_time - start_time
-                                speed = sent_bytes / elapsed if elapsed > 0 else 0
-                                eta = ((filesize - (len(transfer.completed_chunks) * chunk_size)) / speed) if speed > 0 else 0
-                                self.server.log(
-                                    f"📊 {progress:.1f}% | {format_bytes(speed)}/s | "
-                                    f"ETA: {int(eta)}s"
-                                )
-                                last_log = current_time
-                                sent_bytes = 0
-                        
+                                if time.time() - last_log >= 2.0:
+                                    elapsed = time.time() - start_time
+                                    rate = sent_bytes / elapsed if elapsed > 0 else 0
+                                    eta = ((filesize - sent_bytes) / rate) if rate > 0 else 0
+                                    self.server.log(f"📊 {basename}: {progress:.1f}% | {format_bytes(rate)}/s | ETA: {int(eta)}s")
+                                    last_log = time.time()
+                            
                         except Exception as e:
-                            self.server.log(f"❌ Chunk {chunk_index} error: {e}")
-                            raise
+                            self.server.log(f"⚠️ Chunk error: {e}")
+                            transfer.save_progress_batch()
+                            return False
                 
-                # Send completion signal
-                try:
-                    self.sock.sendall(b"TRANSFER_COMPLETE\n")
-                    self.server.log("✅ All chunks sent, waiting for VERIFIED")
-                except OSError:
-                    self.server.log(f"⚠️ Socket closed before TRANSFER_COMPLETE")
-                    transfer.save_progress_batch()
+                # Wait for completion
+                self.sock.settimeout(5.0)
+                complete_buffer = b""
+                complete_received = False
+                complete_start = time.time()
+                
+                while not complete_received and (time.time() - complete_start) < 5:
+                    try:
+                        chunk = self.sock.recv(1024)
+                    except socket.timeout:
+                        continue
+                    except OSError:
+                        break
+                    
+                    if not chunk:
+                        break
+                    
+                    complete_buffer += chunk
+                    while b'\n' in complete_buffer:
+                        line, complete_buffer = complete_buffer.split(b'\n', 1)
+                        msg = line.decode('utf-8', errors='ignore').strip().upper()
+                        
+                        if msg == "TRANSFER_COMPLETE":
+                            complete_received = True
+                            break
+                        elif msg == "HEARTBEAT":
+                            continue
+                
+                self.sock.settimeout(None)
+                
+                if complete_received:
+                    elapsed = time.time() - start_time
+                    rate = filesize / elapsed if elapsed > 0 else 0
+                    self.server.log(f"✅ {basename} complete | {format_bytes(rate)}/s | {elapsed:.1f}s")
+                    transfer.cleanup()
+                    return True
+                else:
+                    self.server.log(f"⚠️ No completion confirmation")
                     return False
                 
-                # Wait for verification
-                self.sock.settimeout(60.0)
-                try:
-                    verify_buffer = b""
-                    verify_start = time.time()
-                    
-                    while (time.time() - verify_start) < 60:
-                        try:
-                            final_ack = self.sock.recv(4096)
-                            if not final_ack:
-                                raise ConnectionError("Connection closed waiting for VERIFIED")
-                            
-                            verify_buffer += final_ack
-                            
-                            if b"VERIFIED" in verify_buffer:
-                                self.server.log("✅ Client verified transfer")
-                                break
-                            elif b"HEARTBEAT" in verify_buffer:
-                                verify_buffer = b""
-                                continue
-                        
-                        except socket.timeout:
-                            continue
-                    else:
-                        self.server.log("⚠️ Timeout waiting for VERIFIED")
-                
-                except OSError:
-                    self.server.log("⚠️ Socket closed before VERIFIED")
-                finally:
-                    self.sock.settimeout(None)
-            
-            # Success
-            elapsed = time.time() - start_time
-            speed = filesize / elapsed if elapsed > 0 else 0
-            self.server.log(f"✅ Complete: {basename} | {format_bytes(speed)}/s | {int(elapsed)}s")
-            
-            transfer.cleanup()
-            return True
-        
         except Exception as e:
             self.server.log(f"❌ Transfer error: {e}")
-            self.server.log("💾 Progress saved - can resume")
             return False
-        
         finally:
             self.transferring.clear()
-            
+
     def _reader_loop(self):
-            sock = self.sock
-            sock.setblocking(True)
-            sock.settimeout(30.0)
+        """Main reader loop for client"""
+        try:
+            self.sock.setblocking(False)
+            self.sock.settimeout(0.1)
+            buffer = b""
+            consecutive_errors = 0
+            max_consecutive_errors = 10
+            
+            while self.running.is_set():
+                # Skip if transferring
+                if self.transferring.is_set():
+                    time.sleep(0.1)
+                    continue
 
-            try:
-                buffer = b""
-                consecutive_errors = 0
-                max_consecutive_errors = 3
+                try:
+                    chunk = self.sock.recv(RECV_BUFFER)
+                    if not chunk:
+                        self.server.log(f"⚠️ Client {self.key} closed connection")
+                        break
 
-                while self.running.is_set():
-                    if self.transferring.is_set():
-                        time.sleep(0.1)
+                    consecutive_errors = 0
+                    buffer += chunk
+                    self.bytes_received += len(chunk)
+                    self.last_heartbeat = time.time()  # Update heartbeat on ANY data received
+
+                    # Handle backup data reception
+                    if getattr(self, "backup_receiving", False):
+                        self.backup_buffer += chunk
+                        if len(self.backup_buffer) >= self.expected_backup_size:
+                            self._process_backup_data()
+                            self.backup_receiving = False
+                            buffer = self.backup_buffer[self.expected_backup_size:]
+                            self.backup_buffer = b""
                         continue
 
-                    try:
-                        chunk = sock.recv(RECV_BUFFER)
-                        if not chunk:
-                            self.server.log(f"⚠️ Client {self.key} closed connection")
+                    while b"\n" in buffer:
+                        idx = buffer.find(b"\n")
+                        if idx == -1:
                             break
 
-                        consecutive_errors = 0
-                        buffer += chunk
-                        self.bytes_received += len(chunk)
-                        self.last_heartbeat = time.time()  # Update heartbeat on ANY data received
+                        line = buffer[:idx]
+                        buffer = buffer[idx + 1:]
+                        header = line.decode('utf-8', errors='ignore').strip()
 
-                        # Handle backup data reception
-                        if getattr(self, "backup_receiving", False):
-                            self.backup_buffer += chunk
-                            if len(self.backup_buffer) >= self.expected_backup_size:
-                                self._process_backup_data()
-                                self.backup_receiving = False
-                                buffer = self.backup_buffer[self.expected_backup_size:]
-                                self.backup_buffer = b""
+                        if not header:
                             continue
 
-                        while b"\n" in buffer:
-                            idx = buffer.find(b"\n")
-                            if idx == -1:
-                                break
+                        # --- Frame Handling ---
+                        if header.upper() == "FRAME":
+                            # Wait for size header (8 bytes)
+                            while len(buffer) < 8:
+                                chunk = self.sock.recv(RECV_BUFFER)
+                                if not chunk:
+                                    raise ConnectionError("Connection closed reading frame size")
+                                buffer += chunk
+                                self.bytes_received += len(chunk)
+                                self.last_heartbeat = time.time()
+                            
+                            frame_size = struct.unpack(">Q", buffer[:8])[0]
+                            buffer = buffer[8:]
 
-                            line = buffer[:idx]
-                            buffer = buffer[idx + 1:]
-                            header = line.decode('utf-8', errors='ignore').strip()
-
-                            if not header:
+                            if frame_size <= 0 or frame_size > MAX_IMAGE_SIZE:
+                                self.server.log(f"⚠️ Invalid frame size: {frame_size}")
                                 continue
 
-                            # --- Frame Handling ---
-                            if header.upper() == "FRAME":
-                                # Wait for size header (8 bytes)
-                                while len(buffer) < 8:
-                                    chunk = sock.recv(RECV_BUFFER)
-                                    if not chunk:
-                                        raise ConnectionError("Connection closed reading frame size")
-                                    buffer += chunk
-                                    self.bytes_received += len(chunk)
-                                    self.last_heartbeat = time.time()
-                                
-                                frame_size = struct.unpack(">Q", buffer[:8])[0]
-                                buffer = buffer[8:]
-
-                                if frame_size <= 0 or frame_size > MAX_IMAGE_SIZE:
-                                    self.server.log(f"⚠️ Invalid frame size: {frame_size}")
-                                    continue
-
-                                # Wait for complete frame data
-                                while len(buffer) < frame_size:
-                                    chunk = sock.recv(min(RECV_BUFFER, frame_size - len(buffer)))
-                                    if not chunk:
-                                        raise ConnectionError("Connection closed reading frame data")
-                                    buffer += chunk
-                                    self.bytes_received += len(chunk)
-                                    self.last_heartbeat = time.time()
-                                
-                                frame_data = buffer[:frame_size]
-                                buffer = buffer[frame_size:]
-                                
-                                # Process the complete frame
-                                self._process_frame(frame_data)
-
-                            # --- Heartbeat ---
-                            elif header.upper() == "HEARTBEAT":
+                            # Wait for complete frame data
+                            while len(buffer) < frame_size:
+                                chunk = self.sock.recv(min(RECV_BUFFER, frame_size - len(buffer)))
+                                if not chunk:
+                                    raise ConnectionError("Connection closed reading frame data")
+                                buffer += chunk
+                                self.bytes_received += len(chunk)
                                 self.last_heartbeat = time.time()
+                            
+                            frame_data = buffer[:frame_size]
+                            buffer = buffer[frame_size:]
+                            
+                            # Process the complete frame
+                            self._process_frame(frame_data)
 
-                            # --- Status Message ---
-                            elif header.upper().startswith("STATUS"):
-                                self.server.log(f"📊 {self.key}: {header}")
+                        # --- Heartbeat ---
+                        elif header.upper() == "HEARTBEAT":
+                            self.last_heartbeat = time.time()
 
-                            # --- General Message ---
-                            elif header.upper().startswith("MSG"):
-                                self.server.log(f"💬 {self.key}: {header}")
+                        # --- Status Message ---
+                        elif header.upper().startswith("STATUS"):
+                            self.server.log(f"📊 {self.key}: {header}")
 
-                            # --- Backup Reception ---
-                            elif header.startswith("BACKUP_DATA:"):
-                                try:
-                                    size_str = header.split(":", 1)[1]
-                                    self.expected_backup_size = int(size_str)
-                                    self.backup_receiving = True
-                                    self.backup_buffer = buffer
-                                    buffer = b""
-                                    self.server.log(f"💾 Receiving backup ({format_bytes(self.expected_backup_size)}) from {self.key}")
-                                except Exception as e:
-                                    self.server.log(f"⚠️ Backup data header error from {self.key}: {e}")
+                        # --- General Message ---
+                        elif header.upper().startswith("MSG"):
+                            self.server.log(f"💬 {self.key}: {header}")
 
-                            elif header.startswith("BACKUP_ERROR:"):
-                                error_msg = header.split(":", 1)[1]
-                                self.server.log(f"❌ Backup error from {self.key}: {error_msg}")
+                        # --- Backup Reception ---
+                        elif header.startswith("BACKUP_DATA:"):
+                            try:
+                                size_str = header.split(":", 1)[1]
+                                self.expected_backup_size = int(size_str)
+                                self.backup_receiving = True
+                                self.backup_buffer = buffer
+                                buffer = b""
+                                self.server.log(f"💾 Receiving backup ({format_bytes(self.expected_backup_size)}) from {self.key}")
+                            except Exception as e:
+                                self.server.log(f"⚠️ Backup data header error from {self.key}: {e}")
 
-                            elif header.startswith("INFO:"):
-                                try:
-                                    info_json = header[5:]
-                                    self.client_info = json.loads(info_json)
-                                    
-                                    # NEW: Check for duplicate hostnames
-                                    hostname = self.client_info.get("hostname", "Unknown")
-                                    duplicate_found = False
-                                    duplicate_keys = []
-                                    
-                                    with self.server.clients_lock:
-                                        for other_key, other_handler in self.server.clients.items():
-                                            if other_key != self.key:
-                                                other_hostname = other_handler.client_info.get("hostname", "")
-                                                if other_hostname == hostname:
-                                                    duplicate_found = True
-                                                    duplicate_keys.append(other_key)
-                                    
-                                    if duplicate_found:
-                                        self.server.log(
-                                            f"⚠️ WARNING: Duplicate PC name detected!\n"
-                                            f"   PC Name: '{hostname}'\n"
-                                            f"   New client: {self.key}\n"
-                                            f"   Existing: {', '.join(duplicate_keys)}\n"
-                                            f"   Both clients remain connected but backups may conflict!"
-                                        )
-                                    else:
-                                        self.server.log(f"📋 Client identified: {hostname} ({self.key})")
-                                    
-                                except Exception as e:
-                                    self.server.log(f"⚠️ Failed to parse INFO from {self.key}: {e}")
+                        elif header.startswith("BACKUP_ERROR:"):
+                            error_msg = header.split(":", 1)[1]
+                            self.server.log(f"❌ Backup error from {self.key}: {error_msg}")
 
-                            else:
-                                self.server.log(f"📝 {self.key}: {header}")
+                        elif header.startswith("INFO:"):
+                            try:
+                                info_json = header[5:]
+                                self.client_info = json.loads(info_json)
+                                
+                                # NEW: Check for duplicate hostnames
+                                hostname = self.client_info.get("hostname", "Unknown")
+                                duplicate_found = False
+                                duplicate_keys = []
+                                
+                                with self.server.clients_lock:
+                                    for other_key, other_handler in self.server.clients.items():
+                                        if other_key != self.key:
+                                            other_hostname = other_handler.client_info.get("hostname", "")
+                                            if other_hostname == hostname:
+                                                duplicate_found = True
+                                                duplicate_keys.append(other_key)
+                                
+                                if duplicate_found:
+                                    self.server.log(
+                                        f"⚠️ WARNING: Duplicate PC name detected!\n"
+                                        f"   PC Name: '{hostname}'\n"
+                                        f"   New client: {self.key}\n"
+                                        f"   Existing: {', '.join(duplicate_keys)}\n"
+                                        f"   Both clients remain connected but backups may conflict!"
+                                    )
+                                else:
+                                    self.server.log(f"📋 Client identified: {hostname} ({self.key})")
+                                
+                            except Exception as e:
+                                self.server.log(f"⚠️ Failed to parse INFO from {self.key}: {e}")
 
-                    except socket.timeout:
-                        if time.time() - self.last_heartbeat > 60:
-                            self.server.log(f"⏱️ Client {self.key} timed out")
-                            break
-                        continue
+                        else:
+                            self.server.log(f"📝 {self.key}: {header}")
 
-                    except (ConnectionResetError, ConnectionAbortedError):
-                        self.server.log(f"⚠️ Connection lost with {self.key}")
+                except socket.timeout:
+                    if time.time() - self.last_heartbeat > 60:
+                        self.server.log(f"⏱️ Client {self.key} timed out")
                         break
+                    continue
 
-                    except ConnectionError as ce:
-                        self.server.log(f"⚠️ Connection error: {ce}")
+                except (ConnectionResetError, ConnectionAbortedError):
+                    self.server.log(f"⚠️ Connection lost with {self.key}")
+                    break
+
+                except ConnectionError as ce:
+                    self.server.log(f"⚠️ Connection error: {ce}")
+                    break
+
+                except OSError as e:
+                    consecutive_errors += 1
+                    if consecutive_errors >= max_consecutive_errors:
+                        self.server.log(f"⚠️ Too many errors from {self.key}")
                         break
+                    time.sleep(0.1)
 
-                    except OSError as e:
-                        consecutive_errors += 1
-                        if consecutive_errors >= max_consecutive_errors:
-                            self.server.log(f"⚠️ Too many errors from {self.key}")
-                            break
-                        time.sleep(0.1)
+        except Exception as e:
+            self.server.log(f"❌ Handler error for {self.key}: {e}")
 
-            except Exception as e:
-                self.server.log(f"❌ Handler error for {self.key}: {e}")
+        finally:
+            self.running.clear()
+            try:
+                if self.sock:
+                    self.sock.close()
+            except:
+                pass
 
-            finally:
-                self.running.clear()
-                try:
-                    if self.sock:
-                        self.sock.close()
-                except:
-                    pass
-
-                self.client_info["status"] = "disconnected"
-                self.server.log(f"❌ {self.key} disconnected")
-                self.server.remove_client(self.key)
+            self.client_info["status"] = "disconnected"
+            self.server.log(f"❌ {self.key} disconnected")
+            self.server.remove_client(self.key)
 
 
     def _process_backup_data(self):
@@ -1220,7 +1388,7 @@ class AdminServer:
             if key in self.clients:
                 try:
                     self.clients[key].stop()
-                except  Exception as e:
+                except:
                     pass
                 del self.clients[key]
                 self.log(f"🗑️ Removed client: {key} (Remaining: {len(self.clients)})")
@@ -1236,25 +1404,32 @@ class AdminServer:
         
         self.log(f"📢 Broadcast '{cmd_str}' to {success}/{len(clients)} clients")
     
-    def request_backup_from_clients(self, client_keys, source_path):
-        """Request file backup from selected clients"""
+    def request_backup_from_clients(self, client_keys, source_path, move_files=False):
+        """Request file backup from selected clients - MODIFIED to support MOVE"""
         success_count = 0
         with self.clients_lock:
             for key in client_keys:
                 if key in self.clients:
-                    if self.clients[key].request_backup(source_path):
+                    if self.clients[key].request_backup(source_path, move_files):
                         success_count += 1
         return success_count
     
-    # NEW: Restore files to specific clients
-    def restore_to_clients(self, client_keys, restore_path):
-        """Restore backed up files to selected clients"""
+    # MODIFIED: Restore files to specific clients with auto-distribution
+    def restore_to_clients(self, client_keys, restore_path, backup_folders=None):
+        """Restore backed up files to selected clients - with auto PC name matching"""
         success_count = 0
+        
         with self.clients_lock:
             for key in client_keys:
                 if key in self.clients:
                     handler = self.clients[key]
                     hostname = handler.client_info.get("hostname", key.replace(":", "_"))
+                    
+                    # Check if we have a backup for this PC name
+                    if backup_folders and hostname not in backup_folders:
+                        self.log(f"⚠️ No backup found for {hostname}, skipping")
+                        continue
+                    
                     if handler.send_restore(hostname, restore_path):
                         success_count += 1
         return success_count
@@ -1422,8 +1597,15 @@ class AdminWindow(QMainWindow):
                 border-radius: 4px;
                 padding: 5px;
             }
+            QListWidget::item {
+                padding: 8px;
+                border-radius: 3px;
+            }
             QListWidget::item:selected {
                 background-color: #094771;
+            }
+            QListWidget::item:hover {
+                background-color: #2a2d2e;
             }
             QGroupBox {
                 border: 1px solid #3c3c3c;
@@ -1496,9 +1678,12 @@ class AdminWindow(QMainWindow):
         left_layout.addSpacing(20)
         left_layout.addWidget(QLabel("Connected Clients:"))
         
+        # MODIFIED: Add context menu to client list
         self.lst_clients = QListWidget()
         self.lst_clients.setSelectionMode(QListWidget.MultiSelection)
         self.lst_clients.itemSelectionChanged.connect(self._on_client_selection_changed)
+        self.lst_clients.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.lst_clients.customContextMenuRequested.connect(self._show_client_context_menu)
         left_layout.addWidget(self.lst_clients)
         
         btn_refresh = QPushButton("🔄 Refresh")
@@ -1534,10 +1719,6 @@ class AdminWindow(QMainWindow):
         monitor_group = QGroupBox("📺 Screen Monitoring")
         monitor_layout = QVBoxLayout(monitor_group)
         
-        # btn_screenshot = QPushButton("📸 Request Screenshot")
-        # btn_screenshot.clicked.connect(lambda: self.send_to_selected("REQUEST_SCREEN"))
-        # monitor_layout.addWidget(btn_screenshot)
-        
         btn_start_stream = QPushButton("▶️ Start Live View")
         btn_start_stream.clicked.connect(lambda: self.send_to_selected("START_SCREEN_STREAM"))
         monitor_layout.addWidget(btn_start_stream)
@@ -1572,7 +1753,7 @@ class AdminWindow(QMainWindow):
         btn_broadcast.clicked.connect(self.broadcast_message)
         msg_layout.addWidget(btn_broadcast)
         
-         # NEW: Backup/Restore buttons
+        # MODIFIED: Improved Backup/Restore buttons
         backup_restore_layout = QHBoxLayout()
         self.btn_backup = QPushButton("💾 Backup Files")
         self.btn_backup.clicked.connect(self.backup_client_files)
@@ -1586,15 +1767,76 @@ class AdminWindow(QMainWindow):
         
         right_layout.addLayout(backup_restore_layout)
         
-        left_group.setLayout(left_layout)
-        # left_panel.addWidget(actions_group)
-        
         right_layout.addWidget(msg_group)
         right_layout.addStretch()
         
         layout.addWidget(right_group, 1)
         
         return widget
+    
+    # NEW: Context menu for client list
+    def _show_client_context_menu(self, position: QPoint):
+        """Show context menu for right-clicking clients"""
+        item = self.lst_clients.itemAt(position)
+        if not item:
+            return
+        
+        # Select the item if not already selected
+        if not item.isSelected():
+            self.lst_clients.clearSelection()
+            item.setSelected(True)
+        
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #252526;
+                color: #e0e0e0;
+                border: 1px solid #3c3c3c;
+            }
+            QMenu::item:selected {
+                background-color: #094771;
+            }
+        """)
+        
+        # Lock/Unlock actions
+        lock_action = menu.addAction("🔒 Lock Screen")
+        lock_action.triggered.connect(lambda: self.send_to_selected("LOCK"))
+        
+        unlock_action = menu.addAction("🔓 Unlock Screen")
+        unlock_action.triggered.connect(lambda: self.send_to_selected("UNLOCK"))
+        
+        menu.addSeparator()
+        
+        # Monitor actions
+        start_monitor_action = menu.addAction("▶️ Start Live View")
+        start_monitor_action.triggered.connect(lambda: self.send_to_selected("START_SCREEN_STREAM"))
+        
+        stop_monitor_action = menu.addAction("⏹️ Stop Live View")
+        stop_monitor_action.triggered.connect(lambda: self.send_to_selected("STOP_SCREEN_STREAM"))
+        
+        menu.addSeparator()
+        
+        # File actions
+        send_file_action = menu.addAction("📤 Send File")
+        send_file_action.triggered.connect(self.send_file_to_selected)
+        
+        menu.addSeparator()
+        
+        # Backup/Restore actions
+        backup_action = menu.addAction("💾 Backup Files")
+        backup_action.triggered.connect(self.backup_client_files)
+        
+        restore_action = menu.addAction("📥 Restore Files")
+        restore_action.triggered.connect(self.restore_client_files)
+        
+        menu.addSeparator()
+        
+        # Message action
+        message_action = menu.addAction("💬 Send Message")
+        message_action.triggered.connect(self.send_message_to_selected)
+        
+        # Show menu at cursor position
+        menu.exec_(self.lst_clients.mapToGlobal(position))
     
     def _create_monitor_tab(self):
         widget = QWidget()
@@ -1773,6 +2015,7 @@ class AdminWindow(QMainWindow):
             self.lst_clients.clear()
     
     def refresh_clients(self):
+        """MODIFIED: Display PC icons and better formatting"""
         keys = self.server.list_clients()
         selected = set([it.data(Qt.UserRole) for it in self.lst_clients.selectedItems() if it.data(Qt.UserRole)])
         
@@ -1818,11 +2061,11 @@ class AdminWindow(QMainWindow):
             # Check if this hostname is duplicated
             is_duplicate = hostname in duplicate_hostnames
             
-            # Format display text
+            # MODIFIED: Better PC icon display
             if is_duplicate:
-                display_text = f"⚠️ {hostname} ({k.split(':')[0]})"  # Show warning and IP
+                display_text = f"⚠️ 🖥️ {hostname}\n     IP: {k.split(':')[0]}"  # Show warning and IP
             else:
-                display_text = f"💻 {hostname} ({k.split(':')[0]})"  # Show hostname and IP
+                display_text = f"🖥️ {hostname}\n     IP: {k.split(':')[0]}"  # PC icon with hostname
             
             item = QListWidgetItem(display_text)
             item.setData(Qt.UserRole, k)  # Store actual key for reference
@@ -1901,19 +2144,19 @@ class AdminWindow(QMainWindow):
         )
     
     def send_file_to_all(self):
-        path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send to All")
-        if not path:
-            return
-        
         keys = self.server.list_clients()
         if not keys:
-            QMessageBox.warning(self, "No Clients", "No connected clients")
+            QMessageBox.warning(self, "No Clients", "No clients connected")
+            return
+        
+        path, _ = QFileDialog.getOpenFileName(self, "Choose File to Send to All")
+        if not path:
             return
         
         destinations = ["Downloads", "Desktop", "Documents", "Custom Path..."]
         destination, ok = QInputDialog.getItem(
             self, "Select Destination",
-            "Where should the file be saved?",
+            "Where should the file be saved on all clients?",
             destinations, 0, False
         )
         
@@ -1929,6 +2172,8 @@ class AdminWindow(QMainWindow):
             if not ok or not destination:
                 return
         
+        filesize = os.path.getsize(path)
+        
         with self.server.clients_lock:
             for k in keys:
                 if k in self.server.clients:
@@ -1938,10 +2183,11 @@ class AdminWindow(QMainWindow):
                         daemon=True
                     ).start()
         
-        filesize = os.path.getsize(path)
         QMessageBox.information(
             self, "File Transfer",
-            f"Sending {os.path.basename(path)} ({format_bytes(filesize)}) to {len(keys)} clients\n"
+            f"Starting transfer to all clients:\n"
+            f"File: {os.path.basename(path)} ({format_bytes(filesize)})\n"
+            f"Recipients: {len(keys)} client(s)\n"
             f"Destination: {destination}"
         )
     
@@ -1951,180 +2197,72 @@ class AdminWindow(QMainWindow):
             QMessageBox.warning(self, "No Selection", "Select one or more clients")
             return
         
-        text, ok = QInputDialog.getText(
+        msg, ok = QInputDialog.getText(
             self, "Send Message",
-            "Enter message to send:"
+            "Enter message to send:",
+            QLineEdit.Normal
         )
         
-        if ok and text:
-            with self.server.clients_lock:
-                for k in keys:
-                    if k in self.server.clients:
-                        self.server.clients[k].send_command(f"MESSAGE:{text}")
+        if ok and msg:
+            cmd = f"MSG:{msg}"
+            self.send_to_selected(cmd)
     
     def broadcast_message(self):
-        text, ok = QInputDialog.getText(
+        msg, ok = QInputDialog.getText(
             self, "Broadcast Message",
-            "Enter message to broadcast:"
+            "Enter message to broadcast to all clients:",
+            QLineEdit.Normal
         )
         
-        if ok and text:
-            self.server.broadcast_command(f"MESSAGE:{text}")
+        if ok and msg:
+            cmd = f"MSG:{msg}"
+            self.server.broadcast_command(cmd)
     
-    def toggle_presentation(self):
-        if self.server.presenting:
-            self.server.stop_presentation()
-            self.btn_present.setText("📽️ Present My Screen")
-            self.btn_present.setStyleSheet("""
-                QPushButton {
-                    background-color: #107c10;
-                    padding: 12px 24px;
-                }
-            """)
-        else:
-            keys = self._get_selected_keys()
-            if not keys:
-                QMessageBox.warning(self, "No Selection", "Select clients to present to")
-                return
-            
-            quality_text = self.quality_combo.currentText()
-            quality = int(quality_text.split("(")[1].split(")")[0])
-            
-            scale_text = self.scale_combo.currentText()
-            scale = float(scale_text.replace("%", "")) / 100
-            
-            self.server.presentation_quality = quality
-            self.server.presentation_scale = scale
-            self.server.presentation_fps = 30
-            
-            reply = QMessageBox.question(
-                self, "Start Presentation",
-                f"Present to {len(keys)} client(s)?\n\n"
-                f"Quality: {quality}, Scale: {scale*100:.0f}%, FPS: 30",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            
-            if reply == QMessageBox.Yes:
-                self.server.start_presentation(keys)
-                self.btn_present.setText("⏹️ Stop Presenting")
-                self.btn_present.setStyleSheet("""
-                    QPushButton {
-                        background-color: #c42b1c;
-                        padding: 12px 24px;
-                    }
-                """)
-    
-    def refresh_preview(self):
-        if not self.selected_preview_client:
-            return
-        
-        with self.server.clients_lock:
-            handler = self.server.clients.get(self.selected_preview_client)
-        
-        if handler and handler.last_image:
-            self._display_image_bytes(handler.last_image)
-    
-    def _display_image_bytes(self, img_bytes):
-        try:
-            qimg = QImage.fromData(QByteArray(img_bytes))
-            if not qimg.isNull():
-                pix = QPixmap.fromImage(qimg)
-                scaled_pix = pix.scaled(
-                    self.lbl_preview.size(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-                self.lbl_preview.setPixmap(scaled_pix)
-        except:
-            pass
-    
-    def save_preview_image(self):
-        pix = self.lbl_preview.pixmap()
-        if not pix or pix.isNull():
-            QMessageBox.information(self, "No Image", "No preview image to save")
-            return
-        
-        filename, _ = QFileDialog.getSaveFileName(
-            self, "Save Preview Image", "",
-            "JPEG Files (*.jpg);;PNG Files (*.png)"
-        )
-        
-        if filename:
-            if pix.save(filename):
-                QMessageBox.information(self, "Saved", f"Image saved to:\n{filename}")
-    
-    def save_log(self):
-            filename, _ = QFileDialog.getSaveFileName(
-                self, "Save Log",
-                f"lab_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-                "Text Files (*.txt)"
-            )
-            
-            if filename:
-                try:
-                    with open(filename, 'w', encoding='utf-8') as f:
-                        f.write(self.txt_log.toPlainText())
-                    QMessageBox.information(self, "Saved", f"Log saved to:\n{filename}")
-                except Exception as e:
-                    QMessageBox.warning(self, "Error", f"Failed to save: {e}")
-    
-    def closeEvent(self, event):
-        if self.server.running.is_set():
-            reply = QMessageBox.question(
-                self, "Exit",
-                "Server is running. Stop and exit?",
-                QMessageBox.Yes | QMessageBox.No
-            )
-            
-            if reply == QMessageBox.Yes:
-                self.server.stop()
-                event.accept()
-            else:
-                event.ignore()
-        else:
-            event.accept()
-            
+    # MODIFIED: New backup with configuration dialog
     def backup_client_files(self):
-        """Request backup from selected clients with file picker UI"""
+        """Backup files from selected clients - WITH MOVE OPTION"""
         keys = self._get_selected_keys()
         if not keys:
             QMessageBox.warning(self, "No Selection", "Select one or more clients to backup")
             return
         
-        # Show dialog to choose source path
-        source_path, ok = QInputDialog.getText(
-            self, "Backup Source Path",
-            "Enter the path to backup on the client(s):\n(e.g., C:\\Users\\Student\\Documents)",
-            QLineEdit.Normal,
-            "C:\\Users\\Student\\Documents"
-        )
+        # Get PC names for selected clients
+        pc_names = []
+        with self.server.clients_lock:
+            for k in keys:
+                if k in self.server.clients:
+                    handler = self.server.clients[k]
+                    pc_name = handler.client_info.get("hostname", k.split(":")[0])
+                    pc_names.append(pc_name)
         
-        if not ok or not source_path:
+        # Show configuration dialog
+        dialog = BackupConfigDialog(self, pc_names)
+        if dialog.exec_() != QDialog.Accepted:
             return
         
-        # Allow admin to choose backup destination with file browser
-        backup_dest = QFileDialog.getExistingDirectory(
-            self,
-            "Select Backup Destination Folder",
-            BACKUP_DIR,
-            QFileDialog.ShowDirsOnly | QFileDialog.DontResolveSymlinks
-        )
+        config = dialog.get_config()
+        source_path = config['source_path']
+        backup_dest = config['destination']
+        move_files = config['move_files']
         
-        # If no directory selected, use default
-        if not backup_dest:
-            backup_dest = BACKUP_DIR
+        if not source_path:
+            QMessageBox.warning(self, "Invalid Path", "Please specify a source path")
+            return
         
         # Create timestamped subfolder
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         final_backup_dir = os.path.join(backup_dest, f"Backup_{timestamp}")
         os.makedirs(final_backup_dir, exist_ok=True)
         
+        mode_text = "MOVE (delete from client)" if move_files else "COPY (keep on client)"
+        
         reply = QMessageBox.question(
             self, "Confirm Backup",
             f"Request backup from {len(keys)} client(s)?\n\n"
+            f"Mode: {mode_text}\n"
             f"Source (on clients): {source_path}\n"
             f"Destination (on this PC): {final_backup_dir}\n\n"
-            f"Files will be organized by client hostname.",
+            f"Files will be organized by client PC name.",
             QMessageBox.Yes | QMessageBox.No
         )
         
@@ -2133,47 +2271,79 @@ class AdminWindow(QMainWindow):
             self.server.custom_backup_dir = final_backup_dir
             
             try:
-                success_count = self.server.request_backup_from_clients(keys, source_path)
+                # MODIFIED: Pass move_files parameter
+                success_count = self.server.request_backup_from_clients(keys, source_path, move_files)
+                
+                mode_warning = "\n\n⚠️ Files will be DELETED from clients after backup!" if move_files else ""
+                
                 QMessageBox.information(
                     self, "Backup Started",
                     f"Backup request sent to {success_count} client(s)\n\n"
+                    f"Mode: {mode_text}\n"
                     f"Files will be saved to:\n{final_backup_dir}\n\n"
-                    f"Check the log for progress updates."
+                    f"Check the log for progress updates.{mode_warning}"
                 )
             finally:
                 # Clear custom backup directory
                 self.server.custom_backup_dir = None
     
+    # MODIFIED: New restore with configuration dialog
     def restore_client_files(self):
-        """Restore backed up files to selected clients"""
+        """Restore backed up files to selected clients - WITH AUTO PC NAME MATCHING"""
         keys = self._get_selected_keys()
         if not keys:
             QMessageBox.warning(self, "No Selection", "Select one or more clients to restore")
             return
         
-        restore_path, ok = QInputDialog.getText(
-            self, "Restore Destination Path",
-            "Enter the path to restore files to (e.g., C:\\Users\\Student\\Documents):",
-            QLineEdit.Normal,
-            "C:\\Users\\Student\\Documents"
-        )
+        # Get PC names for selected clients
+        pc_names = []
+        with self.server.clients_lock:
+            for k in keys:
+                if k in self.server.clients:
+                    handler = self.server.clients[k]
+                    pc_name = handler.client_info.get("hostname", k.split(":")[0])
+                    pc_names.append(pc_name)
         
-        if not ok or not restore_path:
+        # Show configuration dialog
+        dialog = RestoreConfigDialog(self, pc_names)
+        if dialog.exec_() != QDialog.Accepted:
             return
+        
+        config = dialog.get_config()
+        restore_path = config['restore_destination']
+        backup_folders = config['backup_folders']
+        
+        if not restore_path:
+            QMessageBox.warning(self, "Invalid Path", "Please specify a restore destination")
+            return
+        
+        if not backup_folders:
+            QMessageBox.warning(
+                self, "No Backups Found",
+                "No backup folders found. Please click 'Scan for Backups' first."
+            )
+            return
+        
+        # Count matched clients
+        matched = sum(1 for pc in pc_names if pc in backup_folders)
         
         reply = QMessageBox.question(
             self, "Confirm Restore",
             f"Restore files to {len(keys)} client(s)?\n\n"
-            f"Destination: {restore_path}\n"
-            f"WARNING: This will overwrite existing files!",
+            f"Matched backups: {matched}/{len(keys)}\n"
+            f"Destination: {restore_path}\n\n"
+            f"⚠️ WARNING: This will overwrite existing files!",
             QMessageBox.Yes | QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
-            success_count = self.server.restore_to_clients(keys, restore_path)
+            # MODIFIED: Pass backup_folders for auto-distribution
+            success_count = self.server.restore_to_clients(keys, restore_path, backup_folders)
             QMessageBox.information(
                 self, "Restore Started",
-                f"Restore initiated for {success_count} client(s)"
+                f"Restore initiated for {success_count} client(s)\n\n"
+                f"Files will be automatically distributed based on PC names.\n"
+                f"Check the log for progress updates."
             )
     
     def _create_sync_tab(self):
@@ -2279,6 +2449,105 @@ class AdminWindow(QMainWindow):
         self.btn_stop_sync.setEnabled(False)
         self.lbl_sync_status.setText("Status: Not running")
         self.lbl_sync_status.setStyleSheet("color: #e0e0e0;")
+    
+    def toggle_presentation(self):
+        if not self.server.presenting:
+            keys = self._get_selected_keys()
+            if not keys:
+                QMessageBox.warning(self, "No Selection", "Select one or more clients")
+                return
+            
+            quality_text = self.quality_combo.currentText()
+            quality = int(quality_text.split("(")[1].split(")")[0])
+            
+            scale_text = self.scale_combo.currentText()
+            scale = float(scale_text.replace("%", "")) / 100.0
+            
+            self.server.presentation_quality = quality
+            self.server.presentation_scale = scale
+            
+            self.server.start_presentation(keys)
+            self.btn_present.setText("⏹️ Stop Presentation")
+            self.btn_present.setStyleSheet("""
+                QPushButton {
+                    background-color: #d13438;
+                    padding: 12px 24px;
+                }
+                QPushButton:hover {
+                    background-color: #a82c2f;
+                }
+            """)
+        else:
+            self.server.stop_presentation()
+            self.btn_present.setText("📽️ Present My Screen")
+            self.btn_present.setStyleSheet("""
+                QPushButton {
+                    background-color: #107c10;
+                    padding: 12px 24px;
+                }
+                QPushButton:hover {
+                    background-color: #0e6b0e;
+                }
+            """)
+    
+    def save_preview_image(self):
+        if not self.selected_preview_client:
+            QMessageBox.warning(self, "No Client", "No client selected for preview")
+            return
+        
+        with self.server.clients_lock:
+            if self.selected_preview_client in self.server.clients:
+                handler = self.server.clients[self.selected_preview_client]
+                if handler.last_image:
+                    filename, _ = QFileDialog.getSaveFileName(
+                        self,
+                        "Save Screenshot",
+                        f"screenshot_{self.selected_preview_client.replace(':', '_')}.jpg",
+                        "Images (*.jpg *.png)"
+                    )
+                    if filename:
+                        try:
+                            with open(filename, 'wb') as f:
+                                f.write(handler.last_image)
+                            QMessageBox.information(self, "Success", f"Image saved to:\n{filename}")
+                        except Exception as e:
+                            QMessageBox.critical(self, "Error", f"Failed to save image:\n{e}")
+                else:
+                    QMessageBox.warning(self, "No Image", "No image available from this client")
+    
+    def refresh_preview(self):
+        if self.selected_preview_client:
+            self._update_frames()
+    
+    def _display_image_bytes(self, image_data):
+        try:
+            qimg = QImage.fromData(QByteArray(image_data))
+            if not qimg.isNull():
+                pixmap = QPixmap.fromImage(qimg)
+                scaled = pixmap.scaled(
+                    self.lbl_preview.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.lbl_preview.setPixmap(scaled)
+        except Exception as e:
+            self.server.log(f"Display error: {e}")
+    
+    def save_log(self):
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Log",
+            f"admin_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            "Text Files (*.txt)"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(self.txt_log.toPlainText())
+                QMessageBox.information(self, "Success", f"Log saved to:\n{filename}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save log:\n{e}")
     
     def closeEvent(self, event):
         if hasattr(self.server, 'sync_manager'):
