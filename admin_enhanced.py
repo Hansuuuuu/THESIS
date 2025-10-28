@@ -56,6 +56,8 @@ os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
 BACKUP_DIR = os.path.join(os.path.expanduser("~"), "ClientBackups")
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
+RESTRICTIONS_FILE = os.path.join(os.path.expanduser("~"), "lab_restrictions.json")
+
 PRESENTATION_FPS = 30
 PRESENTATION_QUALITY = 85
 PRESENTATION_SCALE = 1.0
@@ -75,6 +77,211 @@ def format_bytes(size):
 
 class ServerSignals(QObject):
     new_frame = pyqtSignal(str, bytes)
+    
+    
+
+class RestrictionDialog(QDialog):
+    def __init__(self, parent=None, current_restrictions=None):
+        super().__init__(parent)
+        self.setWindowTitle("Site & Keyword Restrictions")
+        self.resize(700, 600)
+        
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1e1e1e;
+                color: #e0e0e0;
+            }
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+            QGroupBox {
+                border: 1px solid #3c3c3c;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                font-weight: bold;
+                color: #4EC9B0;
+            }
+            QLineEdit, QTextEdit, QListWidget {
+                background-color: #252526;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 5px;
+                color: #e0e0e0;
+            }
+            QLabel {
+                color: #e0e0e0;
+            }
+        """)
+        
+        self.restrictions = current_restrictions or {"keywords": [], "sites": []}
+        
+        layout = QVBoxLayout(self)
+        
+        # Header
+        header = QLabel("🚫 Content Restriction Management")
+        header.setFont(QFont("Segoe UI", 14, QFont.Bold))
+        header.setStyleSheet("color: #d13438; padding: 10px;")
+        layout.addWidget(header)
+        
+        info = QLabel("Block websites and search keywords on all client computers")
+        info.setStyleSheet("color: #888; font-style: italic;")
+        layout.addWidget(info)
+        
+        # Keywords Group
+        keyword_group = QGroupBox("🔍 Blocked Keywords")
+        keyword_layout = QVBoxLayout(keyword_group)
+        
+        keyword_info = QLabel("Keywords to block in searches (e.g., 'porn', 'violence', 'drugs')")
+        keyword_info.setStyleSheet("color: #888; font-size: 10px;")
+        keyword_layout.addWidget(keyword_info)
+        
+        self.keyword_list = QListWidget()
+        for keyword in self.restrictions.get("keywords", []):
+            self.keyword_list.addItem(keyword)
+        keyword_layout.addWidget(self.keyword_list)
+        
+        keyword_btn_layout = QHBoxLayout()
+        self.txt_keyword = QLineEdit()
+        self.txt_keyword.setPlaceholderText("Enter keyword to block...")
+        keyword_btn_layout.addWidget(self.txt_keyword)
+        
+        btn_add_keyword = QPushButton("➕ Add")
+        btn_add_keyword.clicked.connect(self._add_keyword)
+        keyword_btn_layout.addWidget(btn_add_keyword)
+        
+        btn_remove_keyword = QPushButton("➖ Remove")
+        btn_remove_keyword.clicked.connect(self._remove_keyword)
+        keyword_btn_layout.addWidget(btn_remove_keyword)
+        
+        keyword_layout.addLayout(keyword_btn_layout)
+        layout.addWidget(keyword_group)
+        
+        # Sites Group
+        site_group = QGroupBox("🌐 Blocked Websites")
+        site_layout = QVBoxLayout(site_group)
+        
+        site_info = QLabel("Domains to block (e.g., 'facebook.com', 'youtube.com', 'reddit.com')")
+        site_info.setStyleSheet("color: #888; font-size: 10px;")
+        site_layout.addWidget(site_info)
+        
+        self.site_list = QListWidget()
+        for site in self.restrictions.get("sites", []):
+            self.site_list.addItem(site)
+        site_layout.addWidget(self.site_list)
+        
+        site_btn_layout = QHBoxLayout()
+        self.txt_site = QLineEdit()
+        self.txt_site.setPlaceholderText("Enter domain to block (e.g., example.com)...")
+        site_btn_layout.addWidget(self.txt_site)
+        
+        btn_add_site = QPushButton("➕ Add")
+        btn_add_site.clicked.connect(self._add_site)
+        site_btn_layout.addWidget(btn_add_site)
+        
+        btn_remove_site = QPushButton("➖ Remove")
+        btn_remove_site.clicked.connect(self._remove_site)
+        site_btn_layout.addWidget(btn_remove_site)
+        
+        site_layout.addLayout(site_btn_layout)
+        layout.addWidget(site_group)
+        
+        # Quick presets
+        preset_layout = QHBoxLayout()
+        preset_layout.addWidget(QLabel("Quick Presets:"))
+        
+        btn_preset_social = QPushButton("📱 Block Social Media")
+        btn_preset_social.clicked.connect(self._preset_social_media)
+        preset_layout.addWidget(btn_preset_social)
+        
+        btn_preset_adult = QPushButton("🔞 Block Adult Content")
+        btn_preset_adult.clicked.connect(self._preset_adult_content)
+        preset_layout.addWidget(btn_preset_adult)
+        
+        btn_clear_all = QPushButton("🗑️ Clear All")
+        btn_clear_all.clicked.connect(self._clear_all)
+        btn_clear_all.setStyleSheet("background-color: #d13438;")
+        preset_layout.addWidget(btn_clear_all)
+        
+        preset_layout.addStretch()
+        layout.addLayout(preset_layout)
+        
+        # Dialog buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.clicked.connect(self.reject)
+        btn_layout.addWidget(btn_cancel)
+        
+        btn_save = QPushButton("💾 Save & Apply")
+        btn_save.clicked.connect(self.accept)
+        btn_save.setStyleSheet("background-color: #107c10;")
+        btn_layout.addWidget(btn_save)
+        
+        layout.addLayout(btn_layout)
+    
+    def _add_keyword(self):
+        keyword = self.txt_keyword.text().strip().lower()
+        if keyword and keyword not in [self.keyword_list.item(i).text() for i in range(self.keyword_list.count())]:
+            self.keyword_list.addItem(keyword)
+            self.txt_keyword.clear()
+    
+    def _remove_keyword(self):
+        current = self.keyword_list.currentItem()
+        if current:
+            self.keyword_list.takeItem(self.keyword_list.row(current))
+    
+    def _add_site(self):
+        site = self.txt_site.text().strip().lower()
+        # Clean up site input
+        site = site.replace("http://", "").replace("https://", "").replace("www.", "")
+        if site and site not in [self.site_list.item(i).text() for i in range(self.site_list.count())]:
+            self.site_list.addItem(site)
+            self.txt_site.clear()
+    
+    def _remove_site(self):
+        current = self.site_list.currentItem()
+        if current:
+            self.site_list.takeItem(self.site_list.row(current))
+    
+    def _preset_social_media(self):
+        social_sites = [
+            "facebook.com", "twitter.com", "instagram.com", 
+            "tiktok.com", "snapchat.com", "reddit.com"
+        ]
+        for site in social_sites:
+            if site not in [self.site_list.item(i).text() for i in range(self.site_list.count())]:
+                self.site_list.addItem(site)
+    
+    def _preset_adult_content(self):
+        adult_keywords = ["porn", "xxx", "adult", "sex", "nude", "nsfw"]
+        for keyword in adult_keywords:
+            if keyword not in [self.keyword_list.item(i).text() for i in range(self.keyword_list.count())]:
+                self.keyword_list.addItem(keyword)
+    
+    def _clear_all(self):
+        reply = QMessageBox.question(
+            self, "Clear All Restrictions",
+            "Remove all keyword and site restrictions?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply == QMessageBox.Yes:
+            self.keyword_list.clear()
+            self.site_list.clear()
+    
+    def get_restrictions(self):
+        keywords = [self.keyword_list.item(i).text() for i in range(self.keyword_list.count())]
+        sites = [self.site_list.item(i).text() for i in range(self.site_list.count())]
+        return {"keywords": keywords, "sites": sites}
 
 
 # NEW: Backup Configuration Dialog
@@ -730,6 +937,29 @@ class ClientHandler:
         self.bytes_received = 0
         self.last_heartbeat = time.time()
         self.client_info = {"hostname": f"Client-{addr[0]}", "status": "connected"}
+        
+    def send_restrictions(self, restrictions):
+        """Send updated restrictions to the client"""
+        try:
+            if not self.sock or not self.running.is_set():
+                return False
+                
+            # Convert restrictions to JSON and send as command
+            restrictions_data = {
+                'keywords': restrictions.get('keywords', []),
+                'sites': restrictions.get('sites', [])
+            }
+            
+            # Send as a command string
+            cmd = f"RESTRICTIONS:{json.dumps(restrictions_data)}"
+            return self.send_command(cmd)
+            
+        except (ConnectionError, BrokenPipeError):
+            print(f"Connection lost with client {self.key}")
+            return False
+        except Exception as e:
+            print(f"Error sending restrictions to {self.key}: {e}")
+            return False
     
     def start(self):
         self.thread.start()
@@ -1431,6 +1661,8 @@ class ClientHandler:
         self.last_image_ts = time.time()
         self.frames_received += 1
         self.server.signals.new_frame.emit(self.key, data)
+        
+    
 
 class AdminServer:
     def __init__(self, host=LISTEN_HOST, port=LISTEN_PORT):
@@ -1452,6 +1684,43 @@ class AdminServer:
         
         self.presenting = False
         self.presentation_thread = None
+        
+        self.restrictions = self.load_restrictions()
+
+    def load_restrictions(self):
+        """Load restrictions from file"""
+        try:
+            if os.path.exists(RESTRICTIONS_FILE):
+                with open(RESTRICTIONS_FILE, 'r') as f:
+                    return json.load(f)
+        except:
+            pass
+        return {"keywords": [], "sites": []}
+    
+    def save_restrictions(self, restrictions):
+        """Save restrictions to file"""
+        try:
+            with open(RESTRICTIONS_FILE, 'w') as f:
+                json.dump(restrictions, f, indent=2)
+            self.restrictions = restrictions
+            self.log(f"💾 Restrictions saved: {len(restrictions['keywords'])} keywords, {len(restrictions['sites'])} sites")
+            return True
+        except Exception as e:
+            self.log(f"❌ Failed to save restrictions: {e}")
+            return False
+    
+    def broadcast_restrictions(self):
+        """Send current restrictions to all connected clients"""
+        with self.clients_lock:
+            clients = list(self.clients.values())
+        
+        success = 0
+        for handler in clients:
+            if handler.send_restrictions(self.restrictions):
+                success += 1
+        
+        self.log(f"📢 Restrictions sent to {success}/{len(clients)} clients")
+        return success
     
     def start(self):
         if self.running.is_set():
@@ -1508,11 +1777,14 @@ class AdminServer:
                 
                 self.total_connections += 1
                 self.log(f"✅ Client connected: {key} (Total: {len(self.clients)})")
+                
+                QTimer.singleShot(500, lambda h=handler: h.send_restrictions(self.restrictions))
             
             except Exception as e:
                 if self.running.is_set():
                     self.log(f"⚠️ Accept error: {e}")
                 break
+
     
     def remove_client(self, key):
         with self.clients_lock:
@@ -1828,6 +2100,21 @@ class AdminWindow(QMainWindow):
         right_group = QGroupBox("Client Actions")
         right_layout = QVBoxLayout(right_group)
         
+        restrictions_group = QGroupBox("🚫 Content Restrictions")
+        restrictions_layout = QVBoxLayout(restrictions_group)
+        
+        self.btn_manage_restrictions = QPushButton("⚙️ Manage Restrictions")
+        self.btn_manage_restrictions.clicked.connect(self.manage_restrictions)
+        self.btn_manage_restrictions.setStyleSheet("background-color: #d13438; font-size: 12px;")
+        restrictions_layout.addWidget(self.btn_manage_restrictions)
+        
+        self.lbl_restriction_count = QLabel("No restrictions active")
+        self.lbl_restriction_count.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        self.lbl_restriction_count.setAlignment(Qt.AlignCenter)
+        restrictions_layout.addWidget(self.lbl_restriction_count)
+        
+        right_layout.addWidget(restrictions_group)
+        
         lock_group = QGroupBox("🔒 Screen Control")
         lock_layout = QVBoxLayout(lock_group)
         
@@ -1906,6 +2193,51 @@ class AdminWindow(QMainWindow):
         layout.addWidget(right_group, 1)
         
         return widget
+    
+    
+    def manage_restrictions(self):
+        """Open restriction management dialog"""
+        dialog = RestrictionDialog(self, self.server.restrictions)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            new_restrictions = dialog.get_restrictions()
+            
+            if self.server.save_restrictions(new_restrictions):
+                # Broadcast to all clients
+                success_count = self.server.broadcast_restrictions()
+                
+                # Update UI
+                self._update_restriction_label()
+                
+                QMessageBox.information(
+                    self,
+                    "Restrictions Updated",
+                    f"Restrictions have been updated and sent to {success_count} client(s).\n\n"
+                    f"Keywords blocked: {len(new_restrictions['keywords'])}\n"
+                    f"Sites blocked: {len(new_restrictions['sites'])}"
+                )
+            else:
+                QMessageBox.critical(
+                    self,
+                    "Error",
+                    "Failed to save restrictions. Please try again."
+                )
+    
+    def _update_restriction_label(self):
+        """Update the restriction count label"""
+        keyword_count = len(self.server.restrictions.get('keywords', []))
+        site_count = len(self.server.restrictions.get('sites', []))
+        
+        if keyword_count == 0 and site_count == 0:
+            self.lbl_restriction_count.setText("No restrictions active")
+            self.lbl_restriction_count.setStyleSheet("color: #888; font-size: 10px; font-style: italic;")
+        else:
+            self.lbl_restriction_count.setText(
+                f"🚫 {keyword_count} keywords, {site_count} sites blocked"
+            )
+            self.lbl_restriction_count.setStyleSheet("color: #d13438; font-size: 10px; font-weight: bold;")
+    
+
     
     # NEW: Context menu for client list
     def _show_client_context_menu(self, position: QPoint):
@@ -2129,6 +2461,8 @@ class AdminWindow(QMainWindow):
             self.lbl_server_status.setStyleSheet("color: #4EC9B0;")
             self.btn_start_server.setEnabled(False)
             self.btn_stop_server.setEnabled(True)
+            
+            self._update_restriction_label()
         else:
             QMessageBox.critical(self, "Error", "Failed to start server")
     

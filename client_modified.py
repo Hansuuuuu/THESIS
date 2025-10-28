@@ -16,6 +16,9 @@ import shutil
 from datetime import datetime
 import traceback
 import io
+import webbrowser
+import urllib.parse
+from urllib.parse import urlparse
 
 try:
     import mss
@@ -37,7 +40,7 @@ from PyQt5.QtGui import QPixmap, QIcon, QFont, QImage, QPainter, QColor
 from PyQt5.QtCore import QByteArray
 
 # Configuration
-SERVER_HOST = '192.168.100.30'
+SERVER_HOST = '192.168.68.105'
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000
@@ -376,6 +379,207 @@ class StudentClient(QWidget):
         self.log("Application started")
         self.log(f"Target server: {SERVER_HOST}:{SERVER_PORT}")
         QTimer.singleShot(500, self.attempt_connection)
+        
+        self.restrictions = {"keywords": [], "sites": []}
+        self.restriction_enabled = True
+        
+        # Update UI to show current restriction status
+        self.update_restriction_indicator()
+        
+        
+        # NEW: Restriction checking methods
+    def is_url_blocked(self, url):
+        """Check if a URL is blocked by restrictions"""
+        if not self.restriction_enabled:
+            return False
+        
+        try:
+            # Parse URL
+            parsed = urlparse(url.lower())
+            domain = parsed.netloc or parsed.path
+            
+            # Remove www. prefix
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            
+            # Check against blocked sites
+            for blocked_site in self.restrictions.get('sites', []):
+                if blocked_site.lower() in domain:
+                    return True
+            
+            # Check query parameters and path for keywords
+            full_url = url.lower()
+            for keyword in self.restrictions.get('keywords', []):
+                if keyword.lower() in full_url:
+                    return True
+            
+            return False
+        except:
+            return False
+    
+    def is_search_blocked(self, search_query):
+        """Check if a search query contains blocked keywords"""
+        if not self.restriction_enabled:
+            return False
+        
+        query_lower = search_query.lower()
+        
+        for keyword in self.restrictions.get('keywords', []):
+            if keyword.lower() in query_lower:
+                return True
+        
+        return False
+    
+    def show_blocked_message(self, reason="content"):
+        """Show a message when content is blocked"""
+        if reason == "keyword":
+            title = "🚫 Search Blocked"
+            message = ("This search contains restricted keywords.\n\n"
+                      "Please contact your teacher if you believe this is an error.")
+        elif reason == "site":
+            title = "🚫 Website Blocked"
+            message = ("This website has been blocked by your administrator.\n\n"
+                      "Please contact your teacher if you need access.")
+        else:
+            title = "🚫 Content Blocked"
+            message = ("This content has been restricted by your administrator.\n\n"
+                      "Please contact your teacher for assistance.")
+        
+        self.signals.show_message.emit(title, message)
+        self.log(f"🚫 Blocked: {reason}")
+    
+    # NEW: Hook into browser/search interception
+    def intercept_browser_request(self, url):
+        """Intercept and check browser requests before opening"""
+        if self.is_url_blocked(url):
+            self.show_blocked_message("site")
+            return False
+        return True
+    
+    def update_restriction_indicator(self):
+        """Update the restriction status indicator"""
+        keyword_count = len(self.restrictions.get('keywords', []))
+        site_count = len(self.restrictions.get('sites', []))
+        
+        if keyword_count == 0 and site_count == 0:
+            self.restriction_indicator.setText("🔓 No restrictions active")
+            self.restriction_indicator.setStyleSheet(
+                "background-color: #2d5016; color: #90ee90; "
+                "padding: 8px; border-radius: 5px; font-size: 11px;"
+            )
+        else:
+            self.restriction_indicator.setText(
+                f"🚫 Content restrictions active: {keyword_count} keywords, {site_count} sites blocked"
+            )
+            self.restriction_indicator.setStyleSheet(
+                "background-color: #5c1919; color: #ff6b6b; "
+                "padding: 8px; border-radius: 5px; font-size: 11px; font-weight: bold;"
+            )
+    
+    def apply_restrictions(self):
+        """Apply restrictions by modifying the hosts file to block websites"""
+        try:
+            import platform
+            if platform.system() != "Windows":
+                self.log("⚠️ Website blocking only supported on Windows")
+                return
+            
+            hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+            
+            # Read current hosts file
+            try:
+                with open(hosts_path, 'r') as f:
+                    hosts_content = f.readlines()
+            except PermissionError:
+                self.log("❌ Cannot modify hosts file - Administrator rights required")
+                self.log("💡 Please run this program as Administrator to enable website blocking")
+                return
+            except Exception as e:
+                self.log(f"❌ Error reading hosts file: {e}")
+                return
+            
+            # Remove old restrictions (lines added by this program)
+            new_hosts = []
+            skip_next = False
+            for line in hosts_content:
+                if "# LAB_RESTRICTION" in line:
+                    continue
+                if not skip_next and "# LAB_RESTRICTION" not in line:
+                    new_hosts.append(line)
+            
+            # Add new restrictions
+            if self.restrictions.get('sites'):
+                new_hosts.append("\n# LAB_RESTRICTION - START\n")
+                for site in self.restrictions.get('sites', []):
+                    # Block both www and non-www versions
+                    site_clean = site.lower().strip()
+                    if site_clean:
+                        new_hosts.append(f"127.0.0.1 {site_clean} # LAB_RESTRICTION\n")
+                        new_hosts.append(f"127.0.0.1 www.{site_clean} # LAB_RESTRICTION\n")
+                new_hosts.append("# LAB_RESTRICTION - END\n")
+            
+            # Write back to hosts file
+            try:
+                with open(hosts_path, 'w') as f:
+                    f.writelines(new_hosts)
+                
+                # Flush DNS cache on Windows
+                import subprocess
+                try:
+                    subprocess.run(['ipconfig', '/flushdns'], 
+                                 capture_output=True, 
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                    self.log(f"✅ Website blocking applied: {len(self.restrictions.get('sites', []))} sites blocked")
+                except:
+                    self.log(f"✅ Hosts file updated (DNS cache not flushed)")
+                    
+            except PermissionError:
+                self.log("❌ Cannot write to hosts file - Administrator rights required")
+                self.log("💡 Please run this program as Administrator to enable website blocking")
+            except Exception as e:
+                self.log(f"❌ Error writing hosts file: {e}")
+                
+        except Exception as e:
+            self.log(f"❌ Error applying restrictions: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+    
+    def remove_restrictions(self):
+        """Remove all restrictions from hosts file"""
+        try:
+            import platform
+            if platform.system() != "Windows":
+                return
+            
+            hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+            
+            try:
+                with open(hosts_path, 'r') as f:
+                    hosts_content = f.readlines()
+            except:
+                return
+            
+            # Remove all LAB_RESTRICTION lines
+            new_hosts = [line for line in hosts_content if "# LAB_RESTRICTION" not in line]
+            
+            try:
+                with open(hosts_path, 'w') as f:
+                    f.writelines(new_hosts)
+                
+                # Flush DNS cache
+                import subprocess
+                try:
+                    subprocess.run(['ipconfig', '/flushdns'], 
+                                 capture_output=True, 
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                except:
+                    pass
+                    
+            except:
+                pass
+                
+        except:
+            pass
     
     def setup_ui(self):
         main_layout = QVBoxLayout()
@@ -417,6 +621,14 @@ class StudentClient(QWidget):
         button_layout.addWidget(self.minimize_button)
         
         main_layout.addLayout(button_layout)
+        
+        self.restriction_indicator = QLabel("🔓 No restrictions active")
+        self.restriction_indicator.setAlignment(Qt.AlignCenter)
+        self.restriction_indicator.setStyleSheet(
+            "background-color: #2d5016; color: #90ee90; "
+            "padding: 8px; border-radius: 5px; font-size: 11px;"
+        )
+        main_layout.addWidget(self.restriction_indicator)
         
         progress_layout = QVBoxLayout()
         self.progress_label = QLabel("No active transfers")
@@ -747,6 +959,33 @@ class StudentClient(QWidget):
     
     def process_command(self, command):
         if command.upper() in ["TRANSFER_COMPLETE", "VERIFIED", "CHUNK_OK", "CHUNK_ERROR", "READY"]:
+            return
+        
+        if command.startswith("RESTRICTIONS:"):
+            try:
+                restrictions_json = command.split(":", 1)[1]
+                new_restrictions = json.loads(restrictions_json)
+                self.restrictions = new_restrictions
+                
+                keyword_count = len(new_restrictions.get('keywords', []))
+                site_count = len(new_restrictions.get('sites', []))
+                
+                self.log(f"🚫 Restrictions updated: {keyword_count} keywords, {site_count} sites blocked")
+                
+                # Update the UI indicator
+                self.update_restriction_indicator()
+                
+                # Apply restrictions immediately
+                self.apply_restrictions()
+                
+                self.signals.show_message.emit(
+                    "Content Restrictions Updated",
+                    f"Your administrator has updated content restrictions.\n\n"
+                    f"Blocked keywords: {keyword_count}\n"
+                    f"Blocked websites: {site_count}"
+                )
+            except Exception as e:
+                self.log(f"❌ Failed to parse restrictions: {e}")
             return
         
         if command == "LOCK":
