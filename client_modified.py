@@ -40,7 +40,7 @@ from PyQt5.QtGui import QPixmap, QIcon, QFont, QImage, QPainter, QColor
 from PyQt5.QtCore import QByteArray
 
 # Configuration
-SERVER_HOST = '192.168.68.105'
+SERVER_HOST = '192.168.68.106'
 SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000

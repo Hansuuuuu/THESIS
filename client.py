@@ -1,6 +1,11 @@
 """
-Lab Manager - Student Client - FIXED Qt THREADING ISSUES
-All Qt operations now properly use signals and run in the main thread
+Lab Manager - Student Client - FIXED VERSION
+Changes:
+- FIXED: Connection works without admin login
+- FIXED: Admin login only required for unlocking screen
+- FIXED: Better fullscreen UI layout with proper spacing
+- NEW: Shutdown/Restart PC functionality
+- NEW: Admin password for unlocking
 """
 
 import sys
@@ -16,6 +21,9 @@ import shutil
 from datetime import datetime
 import traceback
 import io
+import webbrowser
+import urllib.parse
+from urllib.parse import urlparse
 
 try:
     import mss
@@ -36,19 +44,23 @@ from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
 from PyQt5.QtGui import QPixmap, QIcon, QFont, QImage, QPainter, QColor
 from PyQt5.QtCore import QByteArray
 
-# Configuration
-SERVER_HOST = '192.168.68.105'
-SERVER_PORT = 5001
+# Configuration - Default values, can be changed from tray
+DEFAULT_SERVER_HOST = '192.168.68.106'
+DEFAULT_SERVER_PORT = 5001
 BUFFER_SIZE = 65536
 RECONNECT_DELAY = 5000
 SCREENSHOT_QUALITY = 60
-CHUNK_SIZE = 4 * 1024 * 1024
-SOCKET_SEND_BUFFER = 16 * 1024 * 1024
-SOCKET_RECV_BUFFER = 16 * 1024 * 1024
-BATCH_ACK_SIZE = 10
+CHUNK_SIZE = 8 * 1024 * 1024
+SOCKET_SEND_BUFFER = 32 * 1024 * 1024
+SOCKET_RECV_BUFFER = 32 * 1024 * 1024
+BATCH_ACK_SIZE = 20
 RESTORE_TEMP_DIR = os.path.join(os.path.expanduser("~"), "lab_restore_temp")
 RESUME_METADATA_DIR = os.path.join(os.path.expanduser("~"), "lab_transfer_cache_client")
 os.makedirs(RESUME_METADATA_DIR, exist_ok=True)
+os.makedirs(RESTORE_TEMP_DIR, exist_ok=True)
+
+# Config file
+CONFIG_FILE = os.path.join(RESUME_METADATA_DIR, "client_config.json")
 
 
 def format_bytes(size):
@@ -64,9 +76,8 @@ class SignalHandler(QObject):
     show_message = pyqtSignal(str, str)
     file_progress = pyqtSignal(int, str)
     log_message = pyqtSignal(str)
-    # NEW: Signal for progress dialog operations
-    show_progress_dialog = pyqtSignal(str, int)  # title, max_value
-    update_progress_dialog = pyqtSignal(int, str)  # value, label
+    show_progress_dialog = pyqtSignal(str, int)
+    update_progress_dialog = pyqtSignal(int, str)
     close_progress_dialog = pyqtSignal()
 
 
@@ -199,11 +210,12 @@ class PresentationOverlay(QWidget):
 
 
 class LockOverlay(QWidget):
-    def __init__(self, message="🔒 Locked by Administrator", logo_path=None, parent=None):
+    def __init__(self, message="🔒 Locked by Administrator", logo_path=None, parent=None, admin_password="admin123"):
         super().__init__()
         self.parent_window = parent
         self.unlocked = False
         self.logo_pixmap = None
+        self.admin_password = admin_password
         
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, False)
@@ -219,33 +231,41 @@ class LockOverlay(QWidget):
             except:
                 self.logo_pixmap = None
         
+        # FIXED: Better layout for fullscreen
         layout = QVBoxLayout()
         layout.setAlignment(Qt.AlignCenter)
-        layout.setSpacing(30)
-        layout.setContentsMargins(50, 50, 50, 50)
+        layout.setSpacing(50)
+        layout.setContentsMargins(100, 100, 100, 100)
         
+        # Main message - FIXED: Better sizing
         label = QLabel(message)
         label.setStyleSheet("""
             color: white; 
-            font-size: 36px; 
+            font-size: 48px;
             font-weight: bold; 
-            margin: 20px;
-            background-color: rgba(0, 0, 0, 150);
-            padding: 20px;
-            border-radius: 10px;
+            margin: 40px;
+            background-color: rgba(0, 0, 0, 200);
+            padding: 40px 60px;
+            border-radius: 15px;
         """)
         label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        label.setMinimumHeight(150)
         layout.addWidget(label)
         
-        instruction = QLabel("Press 'U' key to unlock")
+        # FIXED: Better instruction display
+        instruction = QLabel("Press 'U' key and enter admin password to unlock")
         instruction.setStyleSheet("""
             color: #cccccc; 
-            font-size: 16px;
-            background-color: rgba(0, 0, 0, 150);
-            padding: 10px;
-            border-radius: 5px;
+            font-size: 20px;
+            background-color: rgba(0, 0, 0, 200);
+            padding: 20px 40px;
+            border-radius: 10px;
+            margin-top: 20px;
         """)
         instruction.setAlignment(Qt.AlignCenter)
+        instruction.setWordWrap(True)
+        instruction.setMinimumHeight(80)
         layout.addWidget(instruction)
         
         layout.addStretch()
@@ -271,18 +291,19 @@ class LockOverlay(QWidget):
         if event.isAutoRepeat():
             return
         
+        # FIXED: Use admin password for unlocking
         if event.key() == Qt.Key_U:
-            code, ok = QInputDialog.getText(
+            password, ok = QInputDialog.getText(
                 self, 
-                "Unlock Screen", 
-                "Enter unlock code:",
-                text=""
+                "Admin Unlock", 
+                "Enter admin password to unlock:",
+                QLineEdit.Password
             )
-            if ok and code == "admin123":
+            if ok and password == self.admin_password:
                 self.unlocked = True
                 self.close()
             elif ok:
-                QMessageBox.warning(self, "Incorrect", "Incorrect unlock code")
+                QMessageBox.warning(self, "Incorrect", "Incorrect admin password")
         else:
             event.ignore()
     
@@ -296,6 +317,8 @@ class LockOverlay(QWidget):
 class StudentClient(QWidget):
     def __init__(self):
         super().__init__()
+        
+        self.load_config()
         
         self.setWindowTitle("Student Client - Enhanced")
         self.setGeometry(100, 100, 900, 650)
@@ -344,7 +367,6 @@ class StudentClient(QWidget):
         self.connecting = False
         self.reconnect_scheduled = False
         
-        # Progress dialog (created in main thread)
         self.progress_dialog = None
         
         self.custom_pc_name = self.load_custom_pc_name()
@@ -355,7 +377,6 @@ class StudentClient(QWidget):
         self.signals.show_message.connect(self.display_message)
         self.signals.file_progress.connect(self.update_file_progress)
         self.signals.log_message.connect(self.append_log)
-        # NEW: Connect progress dialog signals
         self.signals.show_progress_dialog.connect(self._show_progress_dialog)
         self.signals.update_progress_dialog.connect(self._update_progress_dialog)
         self.signals.close_progress_dialog.connect(self._close_progress_dialog)
@@ -374,8 +395,303 @@ class StudentClient(QWidget):
         self.setup_system_tray()
         
         self.log("Application started")
-        self.log(f"Target server: {SERVER_HOST}:{SERVER_PORT}")
+        self.log(f"Target server: {self.server_host}:{self.server_port}")
+        
+        # FIXED: Auto-connect regardless of admin login
         QTimer.singleShot(500, self.attempt_connection)
+        
+        self.restrictions = {"keywords": [], "sites": []}
+        self.restriction_enabled = True
+        
+        self.update_restriction_indicator()
+    
+    def load_config(self):
+        """Load configuration from file"""
+        default_config = {
+            'server_host': DEFAULT_SERVER_HOST,
+            'server_port': DEFAULT_SERVER_PORT,
+            'admin_password': 'admin123'
+        }
+        
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r') as f:
+                    self.config = json.load(f)
+                    for key, value in default_config.items():
+                        if key not in self.config:
+                            self.config[key] = value
+            else:
+                self.config = default_config
+                self.save_config()
+        except:
+            self.config = default_config
+        
+        self.server_host = self.config.get('server_host', DEFAULT_SERVER_HOST)
+        self.server_port = self.config.get('server_port', DEFAULT_SERVER_PORT)
+    
+    def save_config(self):
+        """Save configuration to file"""
+        try:
+            with open(CONFIG_FILE, 'w') as f:
+                json.dump(self.config, f, indent=2)
+            return True
+        except Exception as e:
+            print(f"Failed to save config: {e}")
+            return False
+    
+    def configure_server_ip(self):
+        """Configure server IP address"""
+        current_ip = f"{self.server_host}:{self.server_port}"
+        
+        new_ip, ok = QInputDialog.getText(
+            self,
+            "Configure Server",
+            "Enter server address (IP:PORT):",
+            QLineEdit.Normal,
+            current_ip
+        )
+        
+        if ok and new_ip:
+            try:
+                if ':' in new_ip:
+                    host, port = new_ip.split(':', 1)
+                    port = int(port)
+                else:
+                    host = new_ip
+                    port = DEFAULT_SERVER_PORT
+                
+                self.server_host = host
+                self.server_port = port
+                self.config['server_host'] = host
+                self.config['server_port'] = port
+                self.save_config()
+                
+                self.log(f"✅ Server configured: {host}:{port}")
+                QMessageBox.information(
+                    self, "Server Configured",
+                    f"Server address updated to:\n{host}:{port}\n\n"
+                    "Reconnecting..."
+                )
+                
+                if self.connected:
+                    self.disconnect_socket()
+                    QTimer.singleShot(500, self.attempt_connection)
+                
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid Address", f"Invalid server address format!\n\nUse: IP:PORT\nExample: 192.168.1.100:5001")
+                self.log(f"❌ Invalid server address: {e}")
+    
+    def change_admin_password(self):
+        """Change admin password for unlocking"""
+        old_password, ok = QInputDialog.getText(
+            self,
+            "Change Admin Password",
+            "Enter current admin password:",
+            QLineEdit.Password
+        )
+        
+        if not ok:
+            return
+        
+        if old_password != self.config.get('admin_password', 'admin123'):
+            QMessageBox.warning(self, "Incorrect", "Incorrect current password!")
+            return
+        
+        new_password, ok = QInputDialog.getText(
+            self,
+            "Change Admin Password",
+            "Enter new admin password:",
+            QLineEdit.Password
+        )
+        
+        if ok and new_password:
+            confirm_password, ok = QInputDialog.getText(
+                self,
+                "Change Admin Password",
+                "Confirm new admin password:",
+                QLineEdit.Password
+            )
+            
+            if ok and confirm_password == new_password:
+                self.config['admin_password'] = new_password
+                self.save_config()
+                QMessageBox.information(self, "Success", "Admin password changed successfully!")
+                self.log("🔑 Admin password changed")
+            elif ok:
+                QMessageBox.warning(self, "Mismatch", "Passwords don't match!")
+    
+    def is_url_blocked(self, url):
+        if not self.restriction_enabled:
+            return False
+        
+        try:
+            parsed = urlparse(url.lower())
+            domain = parsed.netloc or parsed.path
+            
+            if domain.startswith('www.'):
+                domain = domain[4:]
+            
+            for blocked_site in self.restrictions.get('sites', []):
+                if blocked_site.lower() in domain:
+                    return True
+            
+            full_url = url.lower()
+            for keyword in self.restrictions.get('keywords', []):
+                if keyword.lower() in full_url:
+                    return True
+            
+            return False
+        except:
+            return False
+    
+    def is_search_blocked(self, search_query):
+        if not self.restriction_enabled:
+            return False
+        
+        query_lower = search_query.lower()
+        
+        for keyword in self.restrictions.get('keywords', []):
+            if keyword.lower() in query_lower:
+                return True
+        
+        return False
+    
+    def show_blocked_message(self, reason="content"):
+        if reason == "keyword":
+            title = "🚫 Search Blocked"
+            message = ("This search contains restricted keywords.\n\n"
+                      "Please contact your teacher if you believe this is an error.")
+        elif reason == "site":
+            title = "🚫 Website Blocked"
+            message = ("This website has been blocked by your administrator.\n\n"
+                      "Please contact your teacher if you need access.")
+        else:
+            title = "🚫 Content Blocked"
+            message = ("This content has been restricted by your administrator.\n\n"
+                      "Please contact your teacher for assistance.")
+        
+        self.signals.show_message.emit(title, message)
+        self.log(f"🚫 Blocked: {reason}")
+    
+    def intercept_browser_request(self, url):
+        if self.is_url_blocked(url):
+            self.show_blocked_message("site")
+            return False
+        return True
+    
+    def update_restriction_indicator(self):
+        keyword_count = len(self.restrictions.get('keywords', []))
+        site_count = len(self.restrictions.get('sites', []))
+        
+        if keyword_count == 0 and site_count == 0:
+            self.restriction_indicator.setText("🔓 No restrictions active")
+            self.restriction_indicator.setStyleSheet(
+                "background-color: #2d5016; color: #90ee90; "
+                "padding: 8px; border-radius: 5px; font-size: 11px;"
+            )
+        else:
+            self.restriction_indicator.setText(
+                f"🚫 Content restrictions active: {keyword_count} keywords, {site_count} sites blocked"
+            )
+            self.restriction_indicator.setStyleSheet(
+                "background-color: #5c1919; color: #ff6b6b; "
+                "padding: 8px; border-radius: 5px; font-size: 11px; font-weight: bold;"
+            )
+    
+    def apply_restrictions(self):
+        try:
+            import platform
+            if platform.system() != "Windows":
+                self.log("⚠️ Website blocking only supported on Windows")
+                return
+            
+            hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+            
+            try:
+                with open(hosts_path, 'r') as f:
+                    hosts_content = f.readlines()
+            except PermissionError:
+                self.log("❌ Cannot modify hosts file - Administrator rights required")
+                self.log("💡 Please run this program as Administrator to enable website blocking")
+                return
+            except Exception as e:
+                self.log(f"❌ Error reading hosts file: {e}")
+                return
+            
+            new_hosts = []
+            skip_next = False
+            for line in hosts_content:
+                if "# LAB_RESTRICTION" in line:
+                    continue
+                if not skip_next and "# LAB_RESTRICTION" not in line:
+                    new_hosts.append(line)
+            
+            if self.restrictions.get('sites'):
+                new_hosts.append("\n# LAB_RESTRICTION - START\n")
+                for site in self.restrictions.get('sites', []):
+                    site_clean = site.lower().strip()
+                    if site_clean:
+                        new_hosts.append(f"127.0.0.1 {site_clean} # LAB_RESTRICTION\n")
+                        new_hosts.append(f"127.0.0.1 www.{site_clean} # LAB_RESTRICTION\n")
+                new_hosts.append("# LAB_RESTRICTION - END\n")
+            
+            try:
+                with open(hosts_path, 'w') as f:
+                    f.writelines(new_hosts)
+                
+                import subprocess
+                try:
+                    subprocess.run(['ipconfig', '/flushdns'], 
+                                 capture_output=True, 
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                    self.log(f"✅ Website blocking applied: {len(self.restrictions.get('sites', []))} sites blocked")
+                except:
+                    self.log(f"✅ Hosts file updated (DNS cache not flushed)")
+                    
+            except PermissionError:
+                self.log("❌ Cannot write to hosts file - Administrator rights required")
+                self.log("💡 Please run this program as Administrator to enable website blocking")
+            except Exception as e:
+                self.log(f"❌ Error writing hosts file: {e}")
+                
+        except Exception as e:
+            self.log(f"❌ Error applying restrictions: {e}")
+            import traceback
+            self.log(traceback.format_exc())
+    
+    def remove_restrictions(self):
+        try:
+            import platform
+            if platform.system() != "Windows":
+                return
+            
+            hosts_path = r"C:\Windows\System32\drivers\etc\hosts"
+            
+            try:
+                with open(hosts_path, 'r') as f:
+                    hosts_content = f.readlines()
+            except:
+                return
+            
+            new_hosts = [line for line in hosts_content if "# LAB_RESTRICTION" not in line]
+            
+            try:
+                with open(hosts_path, 'w') as f:
+                    f.writelines(new_hosts)
+                
+                import subprocess
+                try:
+                    subprocess.run(['ipconfig', '/flushdns'], 
+                                 capture_output=True, 
+                                 creationflags=subprocess.CREATE_NO_WINDOW)
+                except:
+                    pass
+                    
+            except:
+                pass
+                
+        except:
+            pass
     
     def setup_ui(self):
         main_layout = QVBoxLayout()
@@ -392,16 +708,19 @@ class StudentClient(QWidget):
         self.status_label.setStyleSheet("background-color: #3c3c3c; padding: 15px; border-radius: 8px;")
         main_layout.addWidget(self.status_label)
         
-        self.connection_info = QLabel(f"Server: {SERVER_HOST}:{SERVER_PORT}")
+        self.connection_info = QLabel(f"Server: {self.server_host}:{self.server_port}")
         self.connection_info.setAlignment(Qt.AlignCenter)
         self.connection_info.setStyleSheet("color: #888; padding: 5px;")
         main_layout.addWidget(self.connection_info)
         
         button_layout = QHBoxLayout()
         
+        self.test_button = QPushButton("🔍 Test Connection")
+        self.test_button.clicked.connect(self.test_connection)
+        button_layout.addWidget(self.test_button)
+        
         self.reconnect_button = QPushButton("🔄 Reconnect Now")
         self.reconnect_button.clicked.connect(self.manual_reconnect)
-        self.reconnect_button.setEnabled(True)
         button_layout.addWidget(self.reconnect_button)
         
         self.share_screen_button = QPushButton("📷 Share Screen")
@@ -417,6 +736,14 @@ class StudentClient(QWidget):
         button_layout.addWidget(self.minimize_button)
         
         main_layout.addLayout(button_layout)
+        
+        self.restriction_indicator = QLabel("🔓 No restrictions active")
+        self.restriction_indicator.setAlignment(Qt.AlignCenter)
+        self.restriction_indicator.setStyleSheet(
+            "background-color: #2d5016; color: #90ee90; "
+            "padding: 8px; border-radius: 5px; font-size: 11px;"
+        )
+        main_layout.addWidget(self.restriction_indicator)
         
         progress_layout = QVBoxLayout()
         self.progress_label = QLabel("No active transfers")
@@ -458,26 +785,42 @@ class StudentClient(QWidget):
             self.tray_icon.setIcon(QIcon(pixmap))
             self.tray_icon.setToolTip("Student Client")
             
-            tray_menu = QMenu()
-            show_action = QAction("Show Window", self)
-            show_action.triggered.connect(self.show)
-            tray_menu.addAction(show_action)
+            self.update_tray_menu()
             
-            change_name_action = QAction("Change PC Name", self)
-            change_name_action.triggered.connect(self.change_pc_name)
-            tray_menu.addAction(change_name_action)
-            
-            tray_menu.addSeparator()
-            
-            quit_action = QAction("Exit", self)
-            quit_action.triggered.connect(self.quit_application)
-            tray_menu.addAction(quit_action)
-            
-            self.tray_icon.setContextMenu(tray_menu)
             self.tray_icon.activated.connect(self.tray_icon_activated)
             self.tray_icon.show()
         except:
             pass
+    
+    def update_tray_menu(self):
+        """Update system tray menu"""
+        tray_menu = QMenu()
+        
+        show_action = QAction("Show Window", self)
+        show_action.triggered.connect(self.show)
+        tray_menu.addAction(show_action)
+        
+        tray_menu.addSeparator()
+        
+        config_action = QAction("⚙️ Configure Server IP", self)
+        config_action.triggered.connect(self.configure_server_ip)
+        tray_menu.addAction(config_action)
+        
+        password_action = QAction("🔑 Change Admin Password", self)
+        password_action.triggered.connect(self.change_admin_password)
+        tray_menu.addAction(password_action)
+        
+        change_name_action = QAction("✏️ Change PC Name", self)
+        change_name_action.triggered.connect(self.change_pc_name)
+        tray_menu.addAction(change_name_action)
+        
+        tray_menu.addSeparator()
+        
+        quit_action = QAction("Exit", self)
+        quit_action.triggered.connect(self.quit_application)
+        tray_menu.addAction(quit_action)
+        
+        self.tray_icon.setContextMenu(tray_menu)
     
     def tray_icon_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
@@ -507,9 +850,7 @@ class StudentClient(QWidget):
         else:
             self.status_label.setStyleSheet("background-color: #3c3c3c; padding: 15px; border-radius: 8px;")
     
-    # NEW: Thread-safe progress dialog methods
     def _show_progress_dialog(self, title, max_value):
-        """Create progress dialog in main thread"""
         if self.progress_dialog is not None:
             self.progress_dialog.close()
         
@@ -522,7 +863,6 @@ class StudentClient(QWidget):
         QApplication.processEvents()
     
     def _update_progress_dialog(self, value, label):
-        """Update progress dialog in main thread"""
         if self.progress_dialog is not None:
             self.progress_dialog.setValue(value)
             if label:
@@ -530,7 +870,6 @@ class StudentClient(QWidget):
             QApplication.processEvents()
     
     def _close_progress_dialog(self):
-        """Close progress dialog in main thread"""
         if self.progress_dialog is not None:
             self.progress_dialog.close()
             self.progress_dialog = None
@@ -566,7 +905,14 @@ class StudentClient(QWidget):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5)
                 
-                sock.connect((SERVER_HOST, SERVER_PORT))
+                sock.connect((self.server_host, self.server_port))
+                
+                # FIXED: Configure socket buffers for better reliability
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SOCKET_SEND_BUFFER)
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECV_BUFFER)
+                except:
+                    pass
                 sock.settimeout(None)
                 
                 self.client_socket = sock
@@ -580,7 +926,6 @@ class StudentClient(QWidget):
                 QTimer.singleShot(100, self.send_client_info)
                 
                 threading.Thread(target=self.listen_for_commands, daemon=True).start()
-                # FIXED: Use QTimer.singleShot instead of creating timer in thread
                 QTimer.singleShot(0, self.start_heartbeat)
             
             except (socket.timeout, TimeoutError):
@@ -605,10 +950,68 @@ class StudentClient(QWidget):
                 error_msg = str(e)
                 self.signals.update_status.emit(f"❌ Connection failed", "red")
                 self.log(f"Connection failed: {error_msg}")
+                self.log(f"🔍 Troubleshooting:")
+                self.log(f"   1. Is admin server running?")
+                self.log(f"   2. Check IP: {self.server_host}:{self.server_port}")
+                self.log(f"   3. Try pinging admin server")
+                self.log(f"   4. Check firewall on both machines")
+                self.log(f"🔍 Troubleshooting:")
+                self.log(f"   1. Is admin server running?")
+                self.log(f"   2. Check IP: {self.server_host}:{self.server_port}")
+                self.log(f"   3. Try pinging admin server")
+                self.log(f"   4. Check firewall on both machines")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(True))
                 QTimer.singleShot(0, self.schedule_reconnect)
         
         threading.Thread(target=connect_thread, daemon=True).start()
+    
+    def test_connection(self):
+        """Test connection to server without actually connecting"""
+        self.log("🔍 Testing connection to server...")
+        
+        def test_thread():
+            try:
+                test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                test_sock.settimeout(3)
+                
+                self.log(f"📡 Attempting to reach {self.server_host}:{self.server_port}")
+                test_sock.connect((self.server_host, self.server_port))
+                test_sock.close()
+                
+                self.log("✅ Connection test SUCCESS!")
+                self.log("💡 Server is reachable. If still can't connect, try manual reconnect.")
+                self.signals.show_message.emit(
+                    "Connection Test Successful", 
+                    f"Server {self.server_host}:{self.server_port} is reachable!\n\n"
+                    f"Click 'Reconnect Now' to establish connection."
+                )
+            except socket.timeout:
+                self.log("❌ Connection test FAILED: Timeout")
+                self.log("💡 Server not responding. Check if admin is running.")
+                self.signals.show_message.emit(
+                    "Connection Test Failed",
+                    f"Cannot reach {self.server_host}:{self.server_port}\n\n"
+                    f"Possible issues:\n"
+                    f"• Admin server not running\n"
+                    f"• Wrong IP address\n"
+                    f"• Network issues"
+                )
+            except ConnectionRefusedError:
+                self.log("❌ Connection test FAILED: Connection refused")
+                self.log("💡 Port is closed. Make sure admin is running on port 5001.")
+                self.signals.show_message.emit(
+                    "Connection Refused",
+                    f"Server at {self.server_host}:{self.server_port} refused connection\n\n"
+                    f"Make sure admin server is running!"
+                )
+            except Exception as e:
+                self.log(f"❌ Connection test FAILED: {e}")
+                self.signals.show_message.emit(
+                    "Connection Test Failed",
+                    f"Error: {e}\n\nCheck IP address and network settings."
+                )
+        
+        threading.Thread(target=test_thread, daemon=True).start()
     
     def manual_reconnect(self):
         self.log("📍 Manual reconnect requested")
@@ -631,7 +1034,6 @@ class StudentClient(QWidget):
             self.client_socket = None
     
     def start_heartbeat(self):
-        """FIXED: Create timer in main thread"""
         self.stop_heartbeat()
         self.heartbeat_timer = QTimer(self)
         self.heartbeat_timer.timeout.connect(self.send_heartbeat)
@@ -663,6 +1065,8 @@ class StudentClient(QWidget):
         buffer = b""
         consecutive_errors = 0
         max_consecutive_errors = 3
+        
+        self.restore_destination = None
         
         while self.connected and self.running:
             try:
@@ -701,6 +1105,11 @@ class StudentClient(QWidget):
                                 buffer = self._handle_resumable_transfer(buffer)
                             except Exception as e:
                                 self.log(f"Transfer error: {e}")
+                            continue
+                        
+                        elif command.startswith("RESTORE_START:"):
+                            self.restore_destination = command.split(":", 1)[1]
+                            self.log(f"📥 Restore initiated to: {self.restore_destination}")
                             continue
                         
                         else:
@@ -743,6 +1152,38 @@ class StudentClient(QWidget):
         if command.upper() in ["TRANSFER_COMPLETE", "VERIFIED", "CHUNK_OK", "CHUNK_ERROR", "READY"]:
             return
         
+        if command == "SHUTDOWN_PC":
+            self.shutdown_pc()
+            return
+        elif command == "RESTART_PC":
+            self.restart_pc()
+            return
+        
+        if command.startswith("RESTRICTIONS:"):
+            try:
+                restrictions_json = command.split(":", 1)[1]
+                new_restrictions = json.loads(restrictions_json)
+                self.restrictions = new_restrictions
+                
+                keyword_count = len(new_restrictions.get('keywords', []))
+                site_count = len(new_restrictions.get('sites', []))
+                
+                self.log(f"🚫 Restrictions updated: {keyword_count} keywords, {site_count} sites blocked")
+                
+                self.update_restriction_indicator()
+                
+                self.apply_restrictions()
+                
+                self.signals.show_message.emit(
+                    "Content Restrictions Updated",
+                    f"Your administrator has updated content restrictions.\n\n"
+                    f"Blocked keywords: {keyword_count}\n"
+                    f"Blocked websites: {site_count}"
+                )
+            except Exception as e:
+                self.log(f"❌ Failed to parse restrictions: {e}")
+            return
+        
         if command == "LOCK":
             self.lock_screen()
         elif command == "UNLOCK":
@@ -777,14 +1218,93 @@ class StudentClient(QWidget):
                 daemon=True
             ).start()
         
+        elif command.startswith("BACKUP:"):
+            parts = command.split(":", 2)
+            if len(parts) >= 3:
+                mode = parts[1]
+                source_path = parts[2]
+                move_files = (mode == "MOVE")
+                self.log(f"💾 Backup requested ({mode}): {source_path}")
+                threading.Thread(
+                    target=self.handle_backup_request,
+                    args=(source_path, move_files),
+                    daemon=True
+                ).start()
+            else:
+                source_path = command.split(":", 1)[1]
+                self.log(f"💾 Backup requested: {source_path}")
+                threading.Thread(
+                    target=self.handle_backup_request,
+                    args=(source_path, False),
+                    daemon=True
+                ).start()
+        
         elif command.startswith("BACKUP_REQUEST:"):
             source_path = command.split(":", 1)[1]
             self.log(f"💾 Backup requested: {source_path}")
             threading.Thread(
                 target=self.handle_backup_request,
-                args=(source_path,),
+                args=(source_path, False),
                 daemon=True
             ).start()
+    
+    def shutdown_pc(self):
+        """Shutdown this PC"""
+        self.log("⚠️ SHUTDOWN command received from admin")
+        
+        reply = QMessageBox.warning(
+            self,
+            "⚠️ System Shutdown",
+            "Your administrator has requested to shutdown this computer.\n\n"
+            "The system will shutdown in 10 seconds.\n\n"
+            "Click Cancel to abort.",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Ok
+        )
+        
+        if reply == QMessageBox.Ok:
+            self.log("💀 Shutting down system...")
+            try:
+                import platform
+                if platform.system() == "Windows":
+                    os.system("shutdown /s /t 10")
+                elif platform.system() == "Linux":
+                    os.system("shutdown -h +1")
+                else:
+                    self.log("⚠️ Shutdown not supported on this OS")
+            except Exception as e:
+                self.log(f"❌ Shutdown failed: {e}")
+        else:
+            self.log("Shutdown aborted by user")
+    
+    def restart_pc(self):
+        """Restart this PC"""
+        self.log("🔄 RESTART command received from admin")
+        
+        reply = QMessageBox.warning(
+            self,
+            "🔄 System Restart",
+            "Your administrator has requested to restart this computer.\n\n"
+            "The system will restart in 10 seconds.\n\n"
+            "Click Cancel to abort.",
+            QMessageBox.Ok | QMessageBox.Cancel,
+            QMessageBox.Ok
+        )
+        
+        if reply == QMessageBox.Ok:
+            self.log("🔄 Restarting system...")
+            try:
+                import platform
+                if platform.system() == "Windows":
+                    os.system("shutdown /r /t 10")
+                elif platform.system() == "Linux":
+                    os.system("shutdown -r +1")
+                else:
+                    self.log("⚠️ Restart not supported on this OS")
+            except Exception as e:
+                self.log(f"❌ Restart failed: {e}")
+        else:
+            self.log("Restart aborted by user")
     
     def _create_lock_overlay(self, logo_path):
         if getattr(self, "overlay", None) is not None:
@@ -800,7 +1320,8 @@ class StudentClient(QWidget):
         
         logo_path = os.path.join(script_dir, "school_logo.png")
         
-        self.overlay = LockOverlay("🔒 Locked by Administrator", logo_path, self)
+        admin_password = self.config.get('admin_password', 'admin123')
+        self.overlay = LockOverlay("🔒 Locked by Administrator", logo_path, self, admin_password)
         self.overlay.showFullScreen()
     
     def lock_screen(self):
@@ -880,41 +1401,60 @@ class StudentClient(QWidget):
                 return self.client_socket.recv(BUFFER_SIZE)
             except (BlockingIOError, socket.timeout):
                 return b""
+            finally:
+                try:
+                    self.client_socket.settimeout(1.0)
+                except:
+                    pass
         
         def ensure_in_buffer(n):
             nonlocal buffer
             attempts = 0
+            max_attempts = 300
             while len(buffer) < n:
                 if b"TRANSFER_COMPLETE\n" in buffer:
                     return True
                 chunk = recv_more(1.0)
                 if chunk == b"":
                     attempts += 1
-                    if attempts >= 300:
+                    if attempts >= max_attempts:
+                        self.log(f"❌ Timeout waiting for data (needed {n}, have {len(buffer)})")
                         return False
                     time.sleep(0.01)
                     continue
                 buffer += chunk
+                attempts = 0
             return True
         
         try:
+            self.log("📥 Processing file transfer...")
+            
             try:
                 self.client_socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self.client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SOCKET_RECV_BUFFER)
-            except:
-                pass
+                self.client_socket.settimeout(30.0)
+            except Exception as e:
+                self.log(f"⚠️ Socket config warning: {e}")
             
             if not ensure_in_buffer(4):
+                self.log("❌ Failed to read header length")
                 return buffer
             
             header_len = struct.unpack(">I", buffer[:4])[0]
             buffer = buffer[4:]
             
+            self.log(f"📋 Header length: {header_len} bytes")
+            
             if not ensure_in_buffer(header_len):
+                self.log("❌ Failed to read metadata")
                 return buffer
             
-            metadata = json.loads(buffer[:header_len].decode("utf-8"))
-            buffer = buffer[header_len:]
+            try:
+                metadata = json.loads(buffer[:header_len].decode("utf-8"))
+                buffer = buffer[header_len:]
+            except Exception as e:
+                self.log(f"❌ Failed to parse metadata: {e}")
+                return buffer
             
             transfer_id = metadata["transfer_id"]
             filename = metadata["filename"]
@@ -922,53 +1462,71 @@ class StudentClient(QWidget):
             filesize = metadata["filesize"]
             total_chunks = metadata["total_chunks"]
             chunk_size = metadata.get("chunk_size", CHUNK_SIZE)
-            batch_ack_size = metadata.get("batch_ack_size", 5)
+            batch_ack_size = metadata.get("batch_ack_size", BATCH_ACK_SIZE)
             
-            self.log(f"📥 Receiving: {filename} ({filesize//1024//1024} MB)")
+            self.log(f"📥 Receiving: {filename} ({format_bytes(filesize)}, {total_chunks} chunks)")
             self.signals.file_progress.emit(0, f"Starting: {filename}")
             
             receiver = ResumableFileReceiver(transfer_id, filename, destination, filesize, total_chunks)
             
-            filepath = self._resolve_destination_path(destination, filename)
-            if not filepath:
-                try:
-                    self.client_socket.sendall(b"ERROR\n")
-                except:
-                    pass
-                return buffer
+            if destination == "RESTORE_TEMP":
+                filepath = os.path.join(RESTORE_TEMP_DIR, filename)
+                os.makedirs(RESTORE_TEMP_DIR, exist_ok=True)
+                self.log(f"💾 Restore mode: saving to {RESTORE_TEMP_DIR}")
+            else:
+                filepath = self._resolve_destination_path(destination, filename)
+                if not filepath:
+                    self.log("❌ Failed to resolve destination path")
+                    try:
+                        self.client_socket.sendall(b"ERROR:Invalid destination\n")
+                    except:
+                        pass
+                    return buffer
             
             os.makedirs(os.path.dirname(filepath), exist_ok=True)
             
+            self.log("✅ Ready to receive - sending READY")
             try:
                 self.client_socket.sendall(b"READY\n")
-            except:
+                self.client_socket.settimeout(1.0)
+            except Exception as e:
+                self.log(f"❌ Failed to send READY: {e}")
                 return buffer
             
-            self.log("Receiving data...")
+            self.log("📊 Receiving chunks...")
             
             chunk_data_map = {}
             last_update = time.time()
             chunks_since_ack = 0
+            chunks_received = 0
             
             try:
                 while len(receiver.received_chunks) < total_chunks:
                     if b"TRANSFER_COMPLETE\n" in buffer:
                         idx = buffer.find(b"TRANSFER_COMPLETE\n")
                         buffer = buffer[idx + len(b"TRANSFER_COMPLETE\n"):]
+                        self.log(f"📋 Transfer complete marker received")
                         break
                     
                     if not ensure_in_buffer(72):
+                        self.log(f"⚠️ Failed to read chunk header")
                         break
                     
                     try:
                         chunk_index, chunk_data_size = struct.unpack(">II", buffer[:8])
-                    except:
+                    except Exception as e:
+                        self.log(f"❌ Failed to unpack chunk header: {e}")
                         break
                     
                     checksum = buffer[8:72].rstrip(b"\x00").decode("utf-8")
                     buffer = buffer[72:]
                     
+                    if chunk_index >= total_chunks:
+                        self.log(f"⚠️ Invalid chunk index {chunk_index} (max: {total_chunks})")
+                        break
+                    
                     if not ensure_in_buffer(chunk_data_size):
+                        self.log(f"⚠️ Failed to read chunk {chunk_index} data ({chunk_data_size} bytes)")
                         break
                     
                     chunk_data = buffer[:chunk_data_size]
@@ -979,13 +1537,15 @@ class StudentClient(QWidget):
                         if chunks_since_ack >= batch_ack_size:
                             try:
                                 self.client_socket.sendall(b"CHUNK_OK\n")
-                            except:
+                            except Exception as e:
+                                self.log(f"❌ Failed to send ACK: {e}")
                                 return buffer
                             chunks_since_ack = 0
                         continue
                     
                     actual_checksum = receiver._calculate_chunk_checksum(chunk_data)
                     if actual_checksum != checksum:
+                        self.log(f"❌ Checksum mismatch for chunk {chunk_index}")
                         try:
                             self.client_socket.sendall(b"CHUNK_ERROR\n")
                         except:
@@ -995,11 +1555,13 @@ class StudentClient(QWidget):
                     receiver.received_chunks[chunk_index] = checksum
                     chunk_data_map[chunk_index] = chunk_data
                     chunks_since_ack += 1
+                    chunks_received += 1
                     
                     if chunks_since_ack >= batch_ack_size:
                         try:
                             self.client_socket.sendall(b"CHUNK_OK\n")
-                        except:
+                        except Exception as e:
+                            self.log(f"❌ Failed to send ACK: {e}")
                             return buffer
                         chunks_since_ack = 0
                         try:
@@ -1009,7 +1571,10 @@ class StudentClient(QWidget):
                     
                     if time.time() - last_update >= 1.0:
                         progress = receiver.get_progress()
-                        self.signals.file_progress.emit(int(progress), f"{filename}: {progress:.0f}%")
+                        self.signals.file_progress.emit(
+                            int(progress), 
+                            f"{filename}: {progress:.0f}% ({chunks_received}/{total_chunks} chunks)"
+                        )
                         last_update = time.time()
                 
                 if chunks_since_ack > 0:
@@ -1019,37 +1584,114 @@ class StudentClient(QWidget):
                         pass
             
             except Exception as e:
-                self.log(f"Transfer error: {e}")
+                self.log(f"❌ Transfer error: {e}")
+                import traceback
+                self.log(traceback.format_exc())
                 raise
             
             if receiver.is_complete():
-                self.log(f"Writing to disk...")
+                self.log(f"💾 Writing {total_chunks} chunks to disk...")
                 try:
                     with open(filepath, "wb") as f:
                         for i in range(total_chunks):
                             if i in chunk_data_map:
                                 f.write(chunk_data_map[i])
+                            else:
+                                self.log(f"⚠️ Missing chunk {i}")
                     
                     try:
                         self.client_socket.sendall(b"VERIFIED\n")
+                        self.client_socket.sendall(b"TRANSFER_COMPLETE\n")
                     except:
                         pass
                     
                     receiver.cleanup()
                     self.signals.file_progress.emit(100, f"Complete: {filename}")
                     self.log(f"✅ Saved: {filepath}")
-                    self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
+                    
+                    if destination == "RESTORE_TEMP":
+                        self.log(f"🔄 Starting restore extraction...")
+                        threading.Thread(
+                            target=self._extract_restore,
+                            args=(filepath,),
+                            daemon=True
+                        ).start()
+                    else:
+                        self.signals.show_message.emit("File Received", f"Saved to:\n{filepath}")
+                    
                     QTimer.singleShot(3000, lambda: self.signals.file_progress.emit(0, ""))
                 
                 except Exception as e:
-                    self.log(f"Write error: {e}")
+                    self.log(f"❌ Write error: {e}")
+                    import traceback
+                    self.log(traceback.format_exc())
                     raise
+            else:
+                self.log(f"⚠️ Transfer incomplete: {len(receiver.received_chunks)}/{total_chunks} chunks")
         
         except Exception as e:
-            self.log(f"Transfer error: {e}")
+            self.log(f"❌ Transfer error: {e}")
             self.signals.file_progress.emit(0, f"Error")
         
         return buffer
+    
+    def _extract_restore(self, zip_filepath):
+        """Extract restore archive with proper error handling"""
+        try:
+            restore_dest = self.restore_destination or "C:\\Users\\Student\\Documents"
+            
+            self.log(f"📦 Extracting restore to: {restore_dest}")
+            self.signals.show_progress_dialog.emit("Restoring files...", 100)
+            
+            os.makedirs(restore_dest, exist_ok=True)
+            
+            try:
+                with zipfile.ZipFile(zip_filepath, 'r') as zip_ref:
+                    file_list = zip_ref.namelist()
+                    total_files = len(file_list)
+                    
+                    if total_files == 0:
+                        raise Exception("Backup archive is empty")
+                    
+                    self.log(f"📊 Extracting {total_files} files...")
+                    
+                    for idx, file in enumerate(file_list):
+                        try:
+                            zip_ref.extract(file, restore_dest)
+                        except Exception as e:
+                            self.log(f"⚠️ Failed to extract {file}: {e}")
+                        
+                        if (idx + 1) % max(1, total_files // 20) == 0 or (idx + 1) == total_files:
+                            progress = int(((idx + 1) / total_files) * 100)
+                            self.signals.update_progress_dialog.emit(
+                                progress,
+                                f"Extracting files...\n{idx + 1} / {total_files}"
+                            )
+            except zipfile.BadZipFile:
+                raise Exception("Corrupted backup file")
+            except Exception as e:
+                raise Exception(f"Extraction failed: {e}")
+            
+            try:
+                os.remove(zip_filepath)
+            except:
+                pass
+            
+            self.signals.close_progress_dialog.emit()
+            self.log(f"✅ Restore complete: {total_files} files restored to {restore_dest}")
+            
+            QTimer.singleShot(500, lambda: self.signals.show_message.emit(
+                "Restore Complete",
+                f"Successfully restored {total_files} files to:\n{restore_dest}"
+            ))
+            
+        except Exception as e:
+            self.log(f"❌ Restore extraction failed: {e}")
+            self.signals.close_progress_dialog.emit()
+            QTimer.singleShot(500, lambda: self.signals.show_message.emit(
+                "Restore Error",
+                f"Failed to restore files:\n{str(e)}"
+            ))
     
     def _resolve_destination_path(self, destination, filename):
         try:
@@ -1197,8 +1839,7 @@ class StudentClient(QWidget):
             except:
                 self.screen_sharing = False
     
-    def handle_backup_request(self, source_path):
-        """FIXED: Use signals for progress dialog instead of creating in thread"""
+    def handle_backup_request(self, source_path, move_files=False):
         try:
             self.log(f"💾 Backup requested: {source_path}")
             
@@ -1208,10 +1849,8 @@ class StudentClient(QWidget):
                 self.client_socket.sendall(f"BACKUP_ERROR:{error_msg}\n".encode("utf-8"))
                 return
             
-            # Show progress dialog via signal
             self.signals.show_progress_dialog.emit("Preparing backup...", 100)
             
-            # Scan files
             self.signals.update_progress_dialog.emit(5, "Scanning files...")
             
             file_list = []
@@ -1229,13 +1868,11 @@ class StudentClient(QWidget):
             file_count = len(file_list)
             self.log(f"📊 Found {file_count} files ({format_bytes(total_size)})")
             
-            # Create temporary zip file
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             temp_zip = os.path.join(RESUME_METADATA_DIR, f"backup_{timestamp}.zip")
             
             self.signals.update_progress_dialog.emit(10, f"Creating backup archive...\n0 / {file_count} files")
             
-            # Create zip with progress
             with zipfile.ZipFile(temp_zip, 'w', zipfile.ZIP_DEFLATED) as zipf:
                 if os.path.isfile(source_path):
                     zipf.write(source_path, os.path.basename(source_path))
@@ -1259,24 +1896,20 @@ class StudentClient(QWidget):
             
             self.signals.update_progress_dialog.emit(65, "Reading backup file...")
             
-            # Read zip file
             with open(temp_zip, 'rb') as f:
                 zip_data = f.read()
             
             zip_size = len(zip_data)
             self.log(f"📦 Backup size: {format_bytes(zip_size)}")
             
-            # Send backup data with progress
             self.signals.update_progress_dialog.emit(
                 70,
                 f"Uploading backup...\n0% ({format_bytes(0)} / {format_bytes(zip_size)})"
             )
             
-            # Send header
             header = f"BACKUP_DATA:{zip_size}\n".encode("utf-8")
             self.client_socket.sendall(header)
             
-            # Send data in chunks with progress
             chunk_size = 1024 * 1024
             sent = 0
             while sent < zip_size:
@@ -1284,7 +1917,6 @@ class StudentClient(QWidget):
                 self.client_socket.sendall(chunk)
                 sent += len(chunk)
                 
-                # Update progress
                 upload_percent = int((sent / zip_size) * 100)
                 overall_percent = 70 + int(upload_percent * 0.30)
                 self.signals.update_progress_dialog.emit(
@@ -1294,7 +1926,6 @@ class StudentClient(QWidget):
             
             self.signals.update_progress_dialog.emit(100, "Backup complete!")
             
-            # Clean up
             try:
                 os.remove(temp_zip)
             except:
@@ -1302,13 +1933,45 @@ class StudentClient(QWidget):
             
             self.log(f"✅ Backup sent successfully ({format_bytes(zip_size)})")
             
-            # Close progress dialog and show success message
+            if move_files:
+                self.signals.update_progress_dialog.emit(100, "Deleting original files...")
+                deleted_count = 0
+                failed_count = 0
+                
+                for file_path, _ in file_list:
+                    try:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+                            deleted_count += 1
+                    except Exception as e:
+                        failed_count += 1
+                        self.log(f"⚠️ Failed to delete: {os.path.basename(file_path)} ({e})")
+                
+                try:
+                    if os.path.isdir(source_path):
+                        for root, dirs, files in os.walk(source_path, topdown=False):
+                            for dir_name in dirs:
+                                dir_path = os.path.join(root, dir_name)
+                                try:
+                                    if not os.listdir(dir_path):
+                                        os.rmdir(dir_path)
+                                except:
+                                    pass
+                except:
+                    pass
+                
+                self.log(f"🗑️ MOVE completed: {deleted_count} files deleted, {failed_count} failed")
+            
             self.signals.close_progress_dialog.emit()
+            
+            mode_text = "moved (deleted)" if move_files else "backed up"
+            warning_text = f"\n⚠️ {failed_count} files could not be deleted" if (move_files and failed_count > 0) else ""
+            
             QTimer.singleShot(500, lambda: self.signals.show_message.emit(
                 "Backup Complete", 
-                f"Successfully backed up {file_count} files\n"
+                f"Successfully {mode_text} {file_count} files\n"
                 f"Total size: {format_bytes(zip_size)}\n"
-                f"From: {source_path}"
+                f"From: {source_path}{warning_text}"
             ))
         
         except Exception as e:
