@@ -509,6 +509,11 @@ class TeacherClient(QMainWindow):
         if self.presenting:
             self.stop_presentation()
         
+        # NEW: Stop monitoring if active
+        if self.monitoring_client:
+            self.monitoring_client = None
+            self.btn_stop_monitor.setEnabled(False)
+        
         if self.client_socket:
             try:
                 self.client_socket.close()
@@ -548,6 +553,41 @@ class TeacherClient(QMainWindow):
                             client_json = message[12:]
                             clients = json.loads(client_json)
                             self.signals.update_client_list.emit(clients)
+                        
+                        # NEW: Handle monitored frames from admin
+                        elif message.upper() == "MONITORED_FRAME":
+                            # Read frame size
+                            while len(buffer) < 8:
+                                chunk = self.client_socket.recv(BUFFER_SIZE)
+                                if not chunk:
+                                    raise ConnectionError("Connection closed reading frame size")
+                                buffer += chunk
+                            
+                            frame_size = struct.unpack(">Q", buffer[:8])[0]
+                            buffer = buffer[8:]
+                            
+                            if frame_size <= 0 or frame_size > 200 * 1024 * 1024:
+                                self.log(f"⚠️ Invalid monitored frame size: {frame_size}")
+                                continue
+                            
+                            # Read frame data
+                            while len(buffer) < frame_size:
+                                chunk = self.client_socket.recv(min(BUFFER_SIZE, frame_size - len(buffer)))
+                                if not chunk:
+                                    raise ConnectionError("Connection closed reading frame data")
+                                buffer += chunk
+                            
+                            frame_data = buffer[:frame_size]
+                            buffer = buffer[frame_size:]
+                            
+                            # Display the monitored frame
+                            self.signals.update_preview.emit(frame_data)
+                        
+                        # Handle monitoring errors
+                        elif message.startswith("MONITOR_ERROR:"):
+                            error_msg = message.split(":", 1)[1]
+                            self.log(f"❌ Monitoring error: {error_msg}")
+                            self.signals.show_message.emit("Monitoring Error", error_msg)
                         
                         # Handle other messages
                         else:

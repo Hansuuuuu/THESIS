@@ -4,6 +4,7 @@ Changes:
 - FIXED: Connection works without admin login
 - FIXED: Admin login only required for unlocking screen
 - FIXED: Better fullscreen UI layout with proper spacing
+- FIXED: File transfer now sends actual file data (not 0 bytes)
 - NEW: Shutdown/Restart PC functionality
 - NEW: Admin password for unlocking
 """
@@ -863,11 +864,15 @@ class StudentClient(QWidget):
         QApplication.processEvents()
     
     def _update_progress_dialog(self, value, label):
-        if self.progress_dialog is not None:
-            self.progress_dialog.setValue(value)
-            if label:
-                self.progress_dialog.setLabelText(label)
-            QApplication.processEvents()
+        try:
+            if self.progress_dialog is not None:
+                self.progress_dialog.setValue(value)
+                if label:
+                    self.progress_dialog.setLabelText(label)
+                QApplication.processEvents()
+        except (AttributeError, RuntimeError):
+            # Dialog was closed/deleted while updating
+            self.progress_dialog = None
     
     def _close_progress_dialog(self):
         if self.progress_dialog is not None:
@@ -923,7 +928,7 @@ class StudentClient(QWidget):
                 self.log("✅ Successfully connected to server")
                 QTimer.singleShot(0, lambda: self.reconnect_button.setEnabled(False))
                 
-                QTimer.singleShot(100, self.send_client_info)
+                QTimer.singleShot(0, self.send_client_info)
                 
                 threading.Thread(target=self.listen_for_commands, daemon=True).start()
                 QTimer.singleShot(0, self.start_heartbeat)
@@ -950,11 +955,6 @@ class StudentClient(QWidget):
                 error_msg = str(e)
                 self.signals.update_status.emit(f"❌ Connection failed", "red")
                 self.log(f"Connection failed: {error_msg}")
-                self.log(f"🔍 Troubleshooting:")
-                self.log(f"   1. Is admin server running?")
-                self.log(f"   2. Check IP: {self.server_host}:{self.server_port}")
-                self.log(f"   3. Try pinging admin server")
-                self.log(f"   4. Check firewall on both machines")
                 self.log(f"🔍 Troubleshooting:")
                 self.log(f"   1. Is admin server running?")
                 self.log(f"   2. Check IP: {self.server_host}:{self.server_port}")
@@ -2063,6 +2063,7 @@ class StudentClient(QWidget):
             self.log(f"Failed to send client info: {e}")
     
     def collect_and_send_files(self, source_path):
+        """FIXED: Collect files with proper metadata including size"""
         try:
             self.log(f"Collecting files from: {source_path}")
             files_data = []
@@ -2072,12 +2073,13 @@ class StudentClient(QWidget):
                     file_path = os.path.join(root, filename)
                     try:
                         file_hash = self._calculate_file_hash(file_path)
+                        file_size = os.path.getsize(file_path)
                         
                         files_data.append({
                             "path": file_path,
                             "name": filename,
                             "hash": file_hash,
-                            "size": os.path.getsize(file_path)
+                            "size": file_size
                         })
                     except:
                         pass
@@ -2094,34 +2096,47 @@ class StudentClient(QWidget):
             self.log(f"Error collecting files: {e}")
     
     def send_file_to_admin(self, file_path):
+        """FIXED: Send file with ALL data (not just metadata)"""
         try:
             if not os.path.exists(file_path):
+                self.log(f"❌ File not found: {file_path}")
                 return
             
+            # Read the ENTIRE file
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+            
+            file_size = len(file_data)
+            self.log(f"📤 Sending file: {os.path.basename(file_path)} ({format_bytes(file_size)})")
+            
+            # Send header
             header = b"ADMIN_FILE\n"
+            self.client_socket.sendall(header)
+            
+            # Send metadata with size
             metadata = {
                 "path": file_path,
-                "name": os.path.basename(file_path)
+                "name": os.path.basename(file_path),
+                "size": file_size
             }
             meta_json = json.dumps(metadata).encode()
             meta_len = struct.pack(">I", len(meta_json))
             
-            self.client_socket.sendall(header)
             self.client_socket.sendall(meta_len)
             self.client_socket.sendall(meta_json)
             
-            with open(file_path, "rb") as f:
-                while True:
-                    chunk = f.read(BUFFER_SIZE)
-                    if not chunk:
-                        break
-                    self.client_socket.sendall(chunk)
+            # Send the ACTUAL file data
+            self.client_socket.sendall(file_data)
             
+            # Send end marker
             self.client_socket.sendall(b"<END>")
-            self.log(f"File sent to admin: {os.path.basename(file_path)}")
+            
+            self.log(f"✅ File sent to admin: {os.path.basename(file_path)} ({format_bytes(file_size)})")
             
         except Exception as e:
-            self.log(f"Error sending file to admin: {e}")
+            self.log(f"❌ Error sending file to admin: {e}")
+            import traceback
+            self.log(traceback.format_exc())
     
     def _calculate_file_hash(self, file_path):
         sha256 = hashlib.sha256()

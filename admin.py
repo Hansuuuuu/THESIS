@@ -27,6 +27,8 @@ from datetime import datetime
 from queue import Queue, Empty
 from collections import defaultdict, deque
 
+
+
 import mss
 import cv2
 import numpy as np
@@ -666,137 +668,479 @@ class RestoreConfigDialog(QDialog):
             'backup_folders': self.backup_folders
         }
 
-
 class FileSyncManager:
     def __init__(self, server, base_sync_dir=None):
         self.server = server
-        self.base_sync_dir = base_sync_dir or os.path.join(os.path.expanduser("~"), "lab_sync")
+        self.base_sync_dir = base_sync_dir or os.path.join(os.path.expanduser("~"), "lab_auto_backup")
         os.makedirs(self.base_sync_dir, exist_ok=True)
         
-        self.file_hashes = {}
-        self.client_configs = {}
+        # Enhanced tracking with more metadata
+        self.file_metadata = {}  # {client_key: {file_path: {hash, size, mtime, version}}}
+        self.client_configs = {}  # {client_key: {"source_path": path, "enabled": bool}}
         self.sync_thread = None
         self.sync_running = False
-        self.server.log(f"File sync manager initialized at {self.base_sync_dir}")
-    
-    def set_global_source_path(self, source_path):
-        self.global_source_path = source_path
-        self.server.log(f"Global source path set to: {source_path}")
-    
-    def start_sync_cycle(self, sync_interval=30):
-        if self.sync_running:
-            self.server.log("Sync cycle already running")
-            return
+        self.sync_interval = 30  # seconds
+        self.last_sync_time = {}
+        self.sync_stats = defaultdict(lambda: {
+            "files_synced": 0, 
+            "bytes_synced": 0, 
+            "last_sync": None,
+            "content_changes": 0,
+            "new_files": 0,
+            "deleted_files": 0
+        })
         
-        if not hasattr(self, 'global_source_path'):
-            self.server.log("ERROR: Source path not configured")
+        # Version control settings
+        self.keep_versions = 5  # Keep last 5 versions
+        self.version_dir = os.path.join(self.base_sync_dir, "_versions")
+        os.makedirs(self.version_dir, exist_ok=True)
+        
+        self.server.log(f"📁 Auto-backup system initialized at {self.base_sync_dir}")
+        self.server.log(f"📚 File versioning enabled (keeping {self.keep_versions} versions)")
+    
+    def enable_auto_sync_for_client(self, client_key, source_path):
+        """Enable auto-sync for a specific client"""
+        self.client_configs[client_key] = {
+            "source_path": source_path,
+            "enabled": True,
+            "last_check": None
+        }
+        self.server.log(f"✅ Auto-sync enabled for {client_key}: {source_path}")
+        
+        if not self.sync_running:
+            self.start_sync_cycle()
+    
+    def disable_auto_sync_for_client(self, client_key):
+        """Disable auto-sync for a specific client"""
+        if client_key in self.client_configs:
+            self.client_configs[client_key]["enabled"] = False
+            self.server.log(f"⏸️ Auto-sync disabled for {client_key}")
+    
+    def enable_auto_sync_all(self, source_path):
+        """Enable auto-sync for all connected clients"""
+        clients = self.server.list_clients()
+        for client_key in clients:
+            self.enable_auto_sync_for_client(client_key, source_path)
+        
+        self.server.log(f"✅ Auto-sync enabled for {len(clients)} client(s)")
+    
+    def set_sync_interval(self, seconds):
+        """Change the sync interval"""
+        self.sync_interval = max(10, seconds)  # Minimum 10 seconds
+        self.server.log(f"⏱️ Sync interval set to {self.sync_interval} seconds")
+    
+    def start_sync_cycle(self):
+        """Start the automatic sync cycle"""
+        if self.sync_running:
+            self.server.log("⚠️ Sync cycle already running")
             return
         
         self.sync_running = True
-        self.server.log(f"Starting AUTO SYNC for ALL clients (interval: {sync_interval}s)")
+        self.server.log(f"🔄 Auto-sync started (interval: {self.sync_interval}s)")
         
         def sync_loop():
             while self.sync_running:
                 try:
-                    clients = self.server.list_clients()
-                    if clients:
-                        self.server.log(f"Syncing {len(clients)} connected clients...")
-                        for client_key in clients:
-                            self._sync_client_files(client_key, self.global_source_path)
-                    time.sleep(sync_interval)
+                    # Check each configured client
+                    for client_key, config in list(self.client_configs.items()):
+                        if not config.get("enabled", False):
+                            continue
+                        
+                        # Check if client is still connected
+                        with self.server.clients_lock:
+                            if client_key not in self.server.clients:
+                                continue
+                        
+                        source_path = config.get("source_path")
+                        if source_path:
+                            self._sync_client_files(client_key, source_path)
+                    
+                    time.sleep(self.sync_interval)
+                
                 except Exception as e:
-                    self.server.log(f"Sync cycle error: {e}")
+                    self.server.log(f"❌ Sync cycle error: {e}")
                     time.sleep(5)
         
         self.sync_thread = threading.Thread(target=sync_loop, daemon=True)
         self.sync_thread.start()
     
     def stop_sync_cycle(self):
+        """Stop the automatic sync cycle"""
         self.sync_running = False
-        self.server.log("AUTO SYNC stopped")
+        self.server.log("⏹️ Auto-sync stopped")
     
     def _sync_client_files(self, client_key, source_path):
-        cmd = f"COLLECT_FILES:{source_path}"
+        """Request file list from client to check for changes"""
+        try:
+            cmd = f"COLLECT_FILES:{source_path}"
+            
+            with self.server.clients_lock:
+                if client_key in self.server.clients:
+                    handler = self.server.clients[client_key]
+                    handler.send_command(cmd)
+                    
+                    # Update last check time
+                    if client_key in self.client_configs:
+                        self.client_configs[client_key]["last_check"] = time.time()
         
-        with self.server.clients_lock:
-            if client_key in self.server.clients:
-                handler = self.server.clients[client_key]
-                handler.send_command(cmd)
+        except Exception as e:
+            self.server.log(f"❌ Sync error for {client_key}: {e}")
     
     def receive_file_list(self, client_key, files_data):
+        """Process file list from client and detect ALL changes including content changes"""
         try:
             files = json.loads(files_data)
-            client_sync_dir = os.path.join(self.base_sync_dir, client_key.replace(":", "_"))
+            
+            # Get client hostname for better organization
+            hostname = client_key.split(":")[0]
+            with self.server.clients_lock:
+                if client_key in self.server.clients:
+                    handler = self.server.clients[client_key]
+                    hostname = handler.client_info.get("hostname", hostname)
+            
+            client_sync_dir = os.path.join(self.base_sync_dir, hostname)
             os.makedirs(client_sync_dir, exist_ok=True)
             
-            if client_key not in self.file_hashes:
-                self.file_hashes[client_key] = {}
+            # Initialize metadata tracking for this client
+            if client_key not in self.file_metadata:
+                self.file_metadata[client_key] = {}
             
+            current_files = set()
             new_files = []
-            modified_files = []
+            content_changed_files = []
+            size_changed_files = []
             
+            # Detect new and modified files with detailed change tracking
             for file_info in files:
                 file_path = file_info["path"]
                 file_hash = file_info["hash"]
+                file_size = file_info.get("size", 0)
+                file_name = file_info.get("name", os.path.basename(file_path))
                 
-                old_hash = self.file_hashes[client_key].get(file_path)
+                current_files.add(file_path)
+                old_metadata = self.file_metadata[client_key].get(file_path)
                 
-                if old_hash is None:
-                    new_files.append(file_path)
-                    self.server.log(f"NEW: {client_key} -> {file_path}")
-                elif old_hash != file_hash:
-                    modified_files.append(file_path)
-                    self.server.log(f"MODIFIED: {client_key} -> {file_path}")
+                if old_metadata is None:
+                    # Completely NEW file
+                    new_files.append((file_path, file_size, file_name))
+                    self.server.log(f"🆕 NEW FILE: {hostname} -> {file_name} ({format_bytes(file_size)})")
+                    self.sync_stats[client_key]["new_files"] += 1
                 
-                self.file_hashes[client_key][file_path] = file_hash
+                else:
+                    # File exists, check for changes
+                    old_hash = old_metadata.get("hash")
+                    old_size = old_metadata.get("size", 0)
+                    
+                    # CONTENT CHANGE: Hash is different
+                    if old_hash != file_hash:
+                        size_diff = file_size - old_size
+                        change_type = "grew" if size_diff > 0 else "shrunk" if size_diff < 0 else "modified"
+                        
+                        content_changed_files.append((file_path, file_size, file_name))
+                        
+                        self.server.log(
+                            f"📝 CONTENT CHANGED: {hostname} -> {file_name}\n"
+                            f"   Old: {format_bytes(old_size)} (hash: {old_hash[:8]}...)\n"
+                            f"   New: {format_bytes(file_size)} (hash: {file_hash[:8]}...)\n"
+                            f"   Change: {change_type} by {format_bytes(abs(size_diff))}"
+                        )
+                        
+                        self.sync_stats[client_key]["content_changes"] += 1
+                    
+                    # SIZE CHANGE without hash (shouldn't happen but catch it)
+                    elif old_size != file_size:
+                        size_changed_files.append((file_path, file_size, file_name))
+                        self.server.log(
+                            f"⚠️ SIZE CHANGED: {hostname} -> {file_name}\n"
+                            f"   Size: {format_bytes(old_size)} -> {format_bytes(file_size)}"
+                        )
+                
+                # Update metadata with version tracking
+                version = old_metadata.get("version", 0) + 1 if old_metadata else 1
+                
+                self.file_metadata[client_key][file_path] = {
+                    "hash": file_hash,
+                    "size": file_size,
+                    "name": file_name,
+                    "version": version,
+                    "last_update": time.time(),
+                    "last_update_str": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                }
             
-            files_to_request = new_files + modified_files
-            for file_path in files_to_request:
-                self._request_file_from_client(client_key, file_path)
+            # Detect DELETED files
+            old_files = set(self.file_metadata[client_key].keys())
+            deleted_files = old_files - current_files
+            
+            if deleted_files:
+                for file_path in deleted_files:
+                    old_meta = self.file_metadata[client_key][file_path]
+                    file_name = old_meta.get("name", os.path.basename(file_path))
+                    
+                    self.server.log(
+                        f"🗑️ DELETED: {hostname} -> {file_name}\n"
+                        f"   Last version: v{old_meta.get('version', 1)}\n"
+                        f"   Last seen: {old_meta.get('last_update_str', 'Unknown')}"
+                    )
+                    
+                    # Archive the metadata before removing
+                    self._archive_deleted_file_metadata(client_key, file_path, old_meta)
+                    
+                    # Remove from tracking
+                    del self.file_metadata[client_key][file_path]
+                    
+                    self.sync_stats[client_key]["deleted_files"] += 1
+                    
+                    # Keep the backed up file but rename it to show it's deleted
+                    local_path = os.path.join(client_sync_dir, file_name)
+                    if os.path.exists(local_path):
+                        deleted_path = local_path + ".DELETED"
+                        try:
+                            shutil.move(local_path, deleted_path)
+                            self.server.log(f"   📦 Archived to: {os.path.basename(deleted_path)}")
+                        except:
+                            pass
+            
+            # Request ALL changed files (new + content changed + size changed)
+            files_to_request = new_files + content_changed_files + size_changed_files
             
             if files_to_request:
-                self.server.log(f"Sync {client_key}: {len(new_files)} new, {len(modified_files)} modified")
+                total_size = sum(size for _, size, _ in files_to_request)
+                
+                self.server.log(
+                    f"📊 SYNC SUMMARY for {hostname}:\n"
+                    f"   🆕 New: {len(new_files)}\n"
+                    f"   📝 Content Changed: {len(content_changed_files)}\n"
+                    f"   ⚠️ Size Changed: {len(size_changed_files)}\n"
+                    f"   🗑️ Deleted: {len(deleted_files)}\n"
+                    f"   💾 Total to sync: {format_bytes(total_size)}"
+                )
+                
+                # Request each changed file
+                for file_path, file_size, file_name in files_to_request:
+                    self._request_file_from_client(client_key, file_path)
+                
+                # Update sync stats
+                self.sync_stats[client_key]["last_sync"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
+            else:
+                # No changes detected
+                if len(files) > 0:
+                    self.server.log(
+                        f"✅ {hostname}: No changes detected\n"
+                        f"   📁 Monitoring {len(files)} file(s)"
+                    )
+        
         except Exception as e:
-            self.server.log(f"Error processing file list from {client_key}: {e}")
+            self.server.log(f"❌ Error processing file list from {client_key}: {e}")
+            import traceback
+            self.server.log(traceback.format_exc())
+    
+    def _archive_deleted_file_metadata(self, client_key, file_path, metadata):
+        """Archive metadata of deleted files for history"""
+        try:
+            archive_file = os.path.join(self.version_dir, "deleted_files_log.json")
+            
+            archive_data = {}
+            if os.path.exists(archive_file):
+                with open(archive_file, 'r') as f:
+                    archive_data = json.load(f)
+            
+            if client_key not in archive_data:
+                archive_data[client_key] = []
+            
+            archive_data[client_key].append({
+                "file_path": file_path,
+                "metadata": metadata,
+                "deleted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+            
+            with open(archive_file, 'w') as f:
+                json.dump(archive_data, f, indent=2)
+        
+        except:
+            pass
     
     def _request_file_from_client(self, client_key, file_path):
-        cmd = f"SEND_FILE_TO_ADMIN:{file_path}"
+        """Request a specific file from client"""
+        try:
+            cmd = f"SEND_FILE_TO_ADMIN:{file_path}"
+            
+            with self.server.clients_lock:
+                if client_key in self.server.clients:
+                    handler = self.server.clients[client_key]
+                    handler.send_command(cmd)
         
-        with self.server.clients_lock:
-            if client_key in self.server.clients:
-                handler = self.server.clients[client_key]
-                handler.send_command(cmd)
+        except Exception as e:
+            self.server.log(f"❌ Error requesting file from {client_key}: {e}")
     
     def receive_file_from_client(self, client_key, file_info, file_data):
+        """Save received file with versioning support"""
         try:
             file_path = file_info.get("path", "unknown")
             file_name = file_info.get("name", "file")
             
-            client_dir = os.path.join(self.base_sync_dir, client_key.replace(":", "_"))
+            # Get client hostname
+            hostname = client_key.split(":")[0]
+            with self.server.clients_lock:
+                if client_key in self.server.clients:
+                    handler = self.server.clients[client_key]
+                    hostname = handler.client_info.get("hostname", hostname)
+            
+            client_dir = os.path.join(self.base_sync_dir, hostname)
             os.makedirs(client_dir, exist_ok=True)
             
-            relative_path = file_path.replace("\\", "/")
-            save_path = os.path.join(client_dir, relative_path.lstrip("/"))
-            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            # Get current version
+            metadata = self.file_metadata.get(client_key, {}).get(file_path, {})
+            version = metadata.get("version", 1)
             
+            # Main file path
+            save_path = os.path.join(client_dir, file_name)
+            
+            # Create versioned backup if file already exists
+            if os.path.exists(save_path):
+                # Create version directory for this client
+                version_client_dir = os.path.join(self.version_dir, hostname)
+                os.makedirs(version_client_dir, exist_ok=True)
+                
+                # Create versioned filename
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_name, ext = os.path.splitext(file_name)
+                version_filename = f"{base_name}_v{version-1}_{timestamp}{ext}"
+                version_path = os.path.join(version_client_dir, version_filename)
+                
+                try:
+                    # Copy existing file to version history
+                    shutil.copy2(save_path, version_path)
+                    self.server.log(f"   📚 Version saved: {version_filename}")
+                    
+                    # Clean old versions (keep only last N versions)
+                    self._cleanup_old_versions(version_client_dir, file_name)
+                
+                except Exception as e:
+                    self.server.log(f"   ⚠️ Version backup failed: {e}")
+            
+            # Save new file
             with open(save_path, "wb") as f:
                 f.write(file_data)
             
-            self.server.log(f"SAVED: {client_key} -> {save_path}")
+            # Calculate hash for verification
+            received_hash = hashlib.sha256(file_data).hexdigest()
             
+            # Update stats
+            self.sync_stats[client_key]["files_synced"] += 1
+            self.sync_stats[client_key]["bytes_synced"] += len(file_data)
+            
+            self.server.log(
+                f"💾 SAVED: {hostname} -> {file_name}\n"
+                f"   Version: v{version}\n"
+                f"   Size: {format_bytes(len(file_data))}\n"
+                f"   Hash: {received_hash[:16]}...\n"
+                f"   Location: {save_path}"
+            )
+        
         except Exception as e:
-            self.server.log(f"Error saving file from {client_key}: {e}")
+            self.server.log(f"❌ Error saving file from {client_key}: {e}")
+            import traceback
+            self.server.log(traceback.format_exc())
+    
+    def _cleanup_old_versions(self, version_dir, file_name):
+        """Keep only the last N versions of a file"""
+        try:
+            base_name, ext = os.path.splitext(file_name)
+            
+            # Find all versions of this file
+            all_versions = []
+            for f in os.listdir(version_dir):
+                if f.startswith(base_name) and f.endswith(ext):
+                    full_path = os.path.join(version_dir, f)
+                    mtime = os.path.getmtime(full_path)
+                    all_versions.append((full_path, mtime))
+            
+            # Sort by modification time (newest first)
+            all_versions.sort(key=lambda x: x[1], reverse=True)
+            
+            # Delete old versions beyond the limit
+            if len(all_versions) > self.keep_versions:
+                for old_file, _ in all_versions[self.keep_versions:]:
+                    try:
+                        os.remove(old_file)
+                        self.server.log(f"   🗑️ Cleaned old version: {os.path.basename(old_file)}")
+                    except:
+                        pass
+        
+        except Exception as e:
+            self.server.log(f"⚠️ Version cleanup error: {e}")
     
     def get_sync_status(self):
+        """Get current sync status for all clients"""
         status = {
             "running": self.sync_running,
-            "clients_syncing": len(self.file_hashes),
-            "total_files": sum(len(files) for files in self.file_hashes.values()),
-            "sync_dir": self.base_sync_dir
+            "interval": self.sync_interval,
+            "clients_syncing": len([c for c in self.client_configs.values() if c.get("enabled", False)]),
+            "total_files": sum(len(files) for files in self.file_metadata.values()),
+            "sync_dir": self.base_sync_dir,
+            "version_dir": self.version_dir,
+            "keep_versions": self.keep_versions,
+            "client_stats": dict(self.sync_stats)
         }
         return status
-
+    
+    def get_client_sync_info(self, client_key):
+        """Get detailed sync info for a specific client"""
+        config = self.client_configs.get(client_key, {})
+        stats = self.sync_stats.get(client_key, {})
+        file_count = len(self.file_metadata.get(client_key, {}))
+        
+        return {
+            "enabled": config.get("enabled", False),
+            "source_path": config.get("source_path", ""),
+            "last_check": config.get("last_check"),
+            "files_tracked": file_count,
+            "files_synced": stats.get("files_synced", 0),
+            "bytes_synced": stats.get("bytes_synced", 0),
+            "content_changes": stats.get("content_changes", 0),
+            "new_files": stats.get("new_files", 0),
+            "deleted_files": stats.get("deleted_files", 0),
+            "last_sync": stats.get("last_sync")
+        }
+    
+    def get_file_history(self, client_key, file_name):
+        """Get version history for a specific file"""
+        try:
+            hostname = client_key.split(":")[0]
+            with self.server.clients_lock:
+                if client_key in self.server.clients:
+                    handler = self.server.clients[client_key]
+                    hostname = handler.client_info.get("hostname", hostname)
+            
+            version_client_dir = os.path.join(self.version_dir, hostname)
+            
+            if not os.path.exists(version_client_dir):
+                return []
+            
+            base_name, ext = os.path.splitext(file_name)
+            versions = []
+            
+            for f in os.listdir(version_client_dir):
+                if f.startswith(base_name) and f.endswith(ext):
+                    full_path = os.path.join(version_client_dir, f)
+                    size = os.path.getsize(full_path)
+                    mtime = datetime.fromtimestamp(os.path.getmtime(full_path))
+                    
+                    versions.append({
+                        "filename": f,
+                        "path": full_path,
+                        "size": size,
+                        "modified": mtime.strftime("%Y-%m-%d %H:%M:%S")
+                    })
+            
+            # Sort by modification time (newest first)
+            versions.sort(key=lambda x: x["modified"], reverse=True)
+            
+            return versions
+        
+        except:
+            return []
 
 class ResumableFileTransfer:
     def __init__(self, filepath, destination, transfer_id=None):
@@ -897,7 +1241,7 @@ class ClientHandler:
         self.frames_received = 0
         self.bytes_received = 0
         self.last_heartbeat = time.time()
-        self.client_info = {"hostname": f"Client-{addr[0]}", "status": "connected"}
+        self.client_info = {"hostname": "Connecting...", "status": "connected"}
         
     def send_restrictions(self, restrictions):
         try:
@@ -1440,17 +1784,21 @@ class ClientHandler:
                                 info_json = header[5:]
                                 self.client_info = json.loads(info_json)
                                 
+                                # Get hostname - works for both students and teachers
+                                hostname = self.client_info.get("hostname", "Unknown")
+                                
                                 # Check if this is a teacher client
                                 client_type = self.client_info.get("type", "student")
+                                
                                 if client_type == "teacher":
                                     with self.server.teacher_lock:
                                         self.server.teacher_clients[self.key] = True
-                                    self.server.log(f"👨‍🏫 Teacher client connected: {self.key}")
+                                    self.server.log(f"👨‍🏫 Teacher client connected: {hostname} ({self.key})")
                                     # Send client list in a separate thread to avoid blocking
                                     threading.Thread(target=self.server.broadcast_client_list_to_teachers, daemon=True).start()
                                     continue
                                 
-                                hostname = self.client_info.get("hostname", "Unknown")
+                                # For student clients: Check for duplicate hostnames
                                 duplicate_found = False
                                 duplicate_keys = []
                                 
@@ -1471,9 +1819,10 @@ class ClientHandler:
                                         f"   Both clients remain connected but backups may conflict!"
                                     )
                                 else:
-                                    self.server.log(f"📋 Client identified: {hostname} ({self.key})")
-                                    # Notify teachers in separate thread
-                                    threading.Thread(target=self.server.broadcast_client_list_to_teachers, daemon=True).start()
+                                    self.server.log(f"📋 Student client identified: {hostname} ({self.key})")
+                                
+                                # Notify teachers in separate thread
+                                threading.Thread(target=self.server.broadcast_client_list_to_teachers, daemon=True).start()
                                 
                             except Exception as e:
                                 self.server.log(f"⚠️ Failed to parse INFO from {self.key}: {e}")
@@ -1559,18 +1908,26 @@ class ClientHandler:
                                 # Tell clients to start receiving presentation
                                 with self.server.clients_lock:
                                     for target in target_clients:
-                                        # Find client by matching hostname or key
+                                        # FIXED: Parse target to extract key from "hostname (key)" format
+                                        target_key = target
+                                        if "(" in target and ")" in target:
+                                            start = target.rfind("(")
+                                            end = target.rfind(")")
+                                            target_key = target[start+1:end]
+                                        
+                                        # Find client by key or hostname match
                                         for client_key, handler in self.server.clients.items():
                                             client_hostname = handler.client_info.get("hostname", "")
-                                            # Match by hostname or full key string
-                                            if target in client_hostname or target == client_key:
+                                            
+                                            # FIXED: Match by extracted key OR if target contains hostname
+                                            if client_key == target_key or client_hostname in target:
                                                 handler.send_command("START_PRESENTATION")
-                                                self.server.log(f"   ▸ Presentation started for {client_key}")
+                                                self.server.log(f"   ▸ Presentation started for {client_key} ({client_hostname})")
                                                 break
                                 
                             except Exception as e:
                                 self.server.log(f"❌ Error starting teacher presentation: {e}")
-                        
+
                         elif header.startswith("TEACHER_STOP_PRESENTATION"):
                             # Teacher stopped presenting
                             self.server.log(f"⏹️ Teacher {self.key} stopped presenting")
@@ -1578,15 +1935,24 @@ class ClientHandler:
                             if hasattr(self, 'teacher_presentation_targets'):
                                 with self.server.clients_lock:
                                     for target in self.teacher_presentation_targets:
+                                        # FIXED: Parse target to extract key
+                                        target_key = target
+                                        if "(" in target and ")" in target:
+                                            start = target.rfind("(")
+                                            end = target.rfind(")")
+                                            target_key = target[start+1:end]
+                                        
                                         for client_key, handler in self.server.clients.items():
                                             client_hostname = handler.client_info.get("hostname", "")
-                                            if target in client_hostname or target == client_key:
+                                            
+                                            # FIXED: Match by extracted key OR if target contains hostname
+                                            if client_key == target_key or client_hostname in target:
                                                 handler.send_command("STOP_PRESENTATION")
-                                                self.server.log(f"   ▸ Presentation stopped for {client_key}")
+                                                self.server.log(f"   ▸ Presentation stopped for {client_key} ({client_hostname})")
                                                 break
                                 
                                 delattr(self, 'teacher_presentation_targets')
-                        
+
                         elif header.startswith("TEACHER_PRESENT_FRAME"):
                             # Teacher sending presentation frame to forward to clients
                             while len(buffer) < 8:
@@ -1614,14 +1980,23 @@ class ClientHandler:
                                     
                                     with self.server.clients_lock:
                                         for target in self.teacher_presentation_targets:
+                                            # FIXED: Parse target to extract key
+                                            target_key = target
+                                            if "(" in target and ")" in target:
+                                                start = target.rfind("(")
+                                                end = target.rfind(")")
+                                                target_key = target[start+1:end]
+                                            
                                             for client_key, handler in self.server.clients.items():
                                                 client_hostname = handler.client_info.get("hostname", "")
-                                                if target in client_hostname or target == client_key:
+                                                
+                                                # FIXED: Match by extracted key OR if target contains hostname
+                                                if client_key == target_key or client_hostname in target:
                                                     try:
                                                         with handler.lock:
                                                             handler.sock.sendall(header_to_send + frame_data)
-                                                    except:
-                                                        pass
+                                                    except Exception as e:
+                                                        self.server.log(f"⚠️ Failed to send frame to {client_key}: {e}")
                                                     break
                         
                         elif header.startswith("START_TEACHER_PRESENTATION"):
@@ -1653,15 +2028,134 @@ class ClientHandler:
                                 self._process_frame(frame_data)
                             
                         elif header.startswith("MONITOR_CLIENT:"):
-                            client_key = header.split(":", 1)[1]
-                            self.server.log(f"👨‍🏫 Teacher {self.key} monitoring {client_key}")
+                            # Teacher wants to monitor a specific client
+                            client_key = header.split(":", 1)[1].strip()
+                            self.server.log(f"👨‍🏫 Teacher {self.key} requesting to monitor: {client_key}")
+                            
+                            # Parse the client key from "hostname (IP:port)" format
+                            target_key = client_key
+                            if "(" in client_key and ")" in client_key:
+                                start = client_key.rfind("(")
+                                end = client_key.rfind(")")
+                                target_key = client_key[start+1:end].strip()
+                            
+                            # Store which client this teacher is monitoring
+                            self.monitoring_target = target_key
+                            
+                            # Tell the target client to start streaming
+                            with self.server.clients_lock:
+                                if target_key in self.server.clients:
+                                    target_handler = self.server.clients[target_key]
+                                    target_handler.send_command("START_SCREEN_STREAM")
+                                    
+                                    # Register this teacher as a monitor for this client
+                                    if not hasattr(target_handler, 'monitoring_teachers'):
+                                        target_handler.monitoring_teachers = set()
+                                    target_handler.monitoring_teachers.add(self.key)
+                                    
+                                    self.server.log(f"✅ Teacher {self.key} now monitoring {target_key}")
+                                else:
+                                    self.server.log(f"❌ Client {target_key} not found for monitoring")
+                                    self.send_command("MONITOR_ERROR:Client not found")
+
+                        elif header.startswith("STOP_MONITOR_CLIENT"):
+                            # Teacher stopped monitoring
+                            if hasattr(self, 'monitoring_target'):
+                                target_key = self.monitoring_target
+                                self.server.log(f"👨‍🏫 Teacher {self.key} stopped monitoring {target_key}")
+                                
+                                # Remove teacher from monitoring list
+                                with self.server.clients_lock:
+                                    if target_key in self.server.clients:
+                                        target_handler = self.server.clients[target_key]
+                                        if hasattr(target_handler, 'monitoring_teachers'):
+                                            target_handler.monitoring_teachers.discard(self.key)
+                                            
+                                            # If no more teachers monitoring, stop the stream
+                                            if len(target_handler.monitoring_teachers) == 0:
+                                                target_handler.send_command("STOP_SCREEN_STREAM")
+                                                delattr(target_handler, 'monitoring_teachers')
+                                
+                                delattr(self, 'monitoring_target')
                             
                         elif header.startswith("STOP_MONITOR_CLIENT"):
                             self.server.log(f"👨‍🏫 Teacher {self.key} stopped monitoring")
                             
+                      
+                        # Add this in the _reader_loop where other commands are processed:
+                       
+                                
+                        elif header.startswith("FILE_LIST:"):
+                            try:
+                                list_size = int(header.split(":", 1)[1])
+                                
+                                while len(buffer) < list_size:
+                                    chunk = self.sock.recv(min(RECV_BUFFER, list_size - len(buffer)))
+                                    if not chunk:
+                                        raise ConnectionError("Connection closed reading file list")
+                                    buffer += chunk
+                                
+                                file_list_json = buffer[:list_size].decode('utf-8')
+                                buffer = buffer[list_size:]
+                                
+                                # Pass to sync manager
+                                if hasattr(self.server, 'sync_manager'):
+                                    self.server.sync_manager.receive_file_list(self.key, file_list_json)
+                            
+                            except Exception as e:
+                                self.server.log(f"❌ Error receiving file list: {e}")
+
+                        elif header.upper() == "ADMIN_FILE":
+                            # Client sending a file to admin
+                            try:
+                                while len(buffer) < 4:
+                                    chunk = self.sock.recv(RECV_BUFFER)
+                                    if not chunk:
+                                        raise ConnectionError("Connection closed")
+                                    buffer += chunk
+                                
+                                meta_len = struct.unpack(">I", buffer[:4])[0]
+                                buffer = buffer[4:]
+                                
+                                while len(buffer) < meta_len:
+                                    chunk = self.sock.recv(min(RECV_BUFFER, meta_len - len(buffer)))
+                                    if not chunk:
+                                        raise ConnectionError("Connection closed")
+                                    buffer += chunk
+                                
+                                metadata_json = buffer[:meta_len]
+                                buffer = buffer[meta_len:]
+                                
+                                metadata = json.loads(metadata_json.decode('utf-8'))
+                                file_size = metadata.get('size', 0)
+                                
+                                # Receive file data
+                                file_data = b""
+                                while len(file_data) < file_size:
+                                    chunk = self.sock.recv(min(RECV_BUFFER, file_size - len(file_data)))
+                                    if not chunk:
+                                        break
+                                    file_data += chunk
+                                
+                                # Look for end marker
+                                end_buffer = b""
+                                while not end_buffer.endswith(b"<END>"):
+                                    chunk = self.sock.recv(1024)
+                                    if not chunk:
+                                        break
+                                    end_buffer += chunk
+                                    if len(end_buffer) > 10:
+                                        end_buffer = end_buffer[-10:]
+                                
+                                # Pass to sync manager
+                                if hasattr(self.server, 'sync_manager'):
+                                    self.server.sync_manager.receive_file_from_client(self.key, metadata, file_data)
+                            
+                            except Exception as e:
+                                self.server.log(f"❌ Error receiving admin file: {e}")
+                                
                         else:
                             self.server.log(f"📝 {self.key}: {header}")
-
                 except socket.timeout:
                     if time.time() - self.last_heartbeat > 60:
                         self.server.log(f"⏱️ Client {self.key} timed out")
@@ -1761,6 +2255,22 @@ class ClientHandler:
         self.last_image_ts = time.time()
         self.frames_received += 1
         self.server.signals.new_frame.emit(self.key, data)
+        
+        # NEW: Forward frames to any teachers monitoring this client
+        if hasattr(self, 'monitoring_teachers') and self.monitoring_teachers:
+            frame_size = len(data)
+            header_to_send = b"MONITORED_FRAME\n" + struct.pack(">Q", frame_size)
+            
+            with self.server.clients_lock:
+                for teacher_key in list(self.monitoring_teachers):
+                    if teacher_key in self.server.clients:
+                        teacher_handler = self.server.clients[teacher_key]
+                        try:
+                            with teacher_handler.lock:
+                                teacher_handler.sock.sendall(header_to_send + data)
+                        except Exception as e:
+                            self.server.log(f"⚠️ Failed to send monitored frame to teacher {teacher_key}: {e}")
+                            self.monitoring_teachers.discard(teacher_key)
         
     
 
@@ -2214,12 +2724,288 @@ class AdminWindow(QMainWindow):
         """)
         
         self.server = AdminServer()
+        self.server.sync_manager = FileSyncManager(self.server)
         self.selected_preview_client = None
         self.view_mode = "monitor"  # "monitor" or "clients"
         
         self._build_ui()
         self._start_timers()
-    
+    def configure_auto_sync(self):
+        """Configure auto-sync settings"""
+        # Ask for source path
+        templates = [
+            "C:\\Users\\Student\\Documents",
+            "C:\\Users\\Student\\Desktop",
+            "C:\\Users\\Student\\Downloads",
+            "Custom Path..."
+        ]
+        
+        source_path, ok = QInputDialog.getItem(
+            self, "Auto-Sync Configuration",
+            "Select folder to monitor on clients:",
+            templates, 0, False
+        )
+        
+        if not ok:
+            return
+        
+        if source_path == "Custom Path...":
+            source_path, ok = QInputDialog.getText(
+                self, "Custom Path",
+                "Enter full path to monitor:",
+                text="C:\\Users\\Student\\Documents"
+            )
+            if not ok or not source_path:
+                return
+        
+        # Ask for sync interval
+        interval, ok = QInputDialog.getInt(
+            self, "Sync Interval",
+            "Check for changes every (seconds):",
+            30, 10, 3600, 10
+        )
+        
+        if not ok:
+            return
+        
+        # Enable for all clients or selected?
+        reply = QMessageBox.question(
+            self, "Enable Auto-Sync",
+            f"Enable auto-sync for:\n\n"
+            f"Path: {source_path}\n"
+            f"Interval: Every {interval} seconds\n\n"
+            f"Enable for ALL clients or SELECTED clients only?",
+            QMessageBox.Yes | QMessageBox.No | QMessageBox.Cancel,
+            QMessageBox.Yes
+        )
+        
+        if reply == QMessageBox.Cancel:
+            return
+        
+        # Initialize sync manager if not exists
+        if not hasattr(self.server, 'sync_manager'):
+            self.server.sync_manager = FileSyncManager(self.server)
+        
+        self.server.sync_manager.set_sync_interval(interval)
+        
+        if reply == QMessageBox.Yes:
+            # Enable for all
+            self.server.sync_manager.enable_auto_sync_all(source_path)
+            QMessageBox.information(
+                self, "Auto-Sync Enabled",
+                f"Auto-sync enabled for ALL connected clients\n\n"
+                f"Monitoring: {source_path}\n"
+                f"Check interval: {interval}s\n\n"
+                f"Files will be automatically backed up to:\n"
+                f"{self.server.sync_manager.base_sync_dir}"
+            )
+        else:
+            # Enable for selected
+            keys = self._get_selected_keys()
+            if not keys:
+                QMessageBox.warning(self, "No Selection", "Please select clients first")
+                return
+            
+            for key in keys:
+                self.server.sync_manager.enable_auto_sync_for_client(key, source_path)
+            
+            QMessageBox.information(
+                self, "Auto-Sync Enabled",
+                f"Auto-sync enabled for {len(keys)} selected client(s)\n\n"
+                f"Monitoring: {source_path}\n"
+                f"Check interval: {interval}s"
+            )
+        
+        self._update_autosync_ui()
+
+    def toggle_auto_sync(self):
+        """Start/stop auto-sync"""
+        if not hasattr(self.server, 'sync_manager'):
+            QMessageBox.warning(
+                self, "Not Configured",
+                "Please configure auto-sync first"
+            )
+            return
+        
+        if self.server.sync_manager.sync_running:
+            self.server.sync_manager.stop_sync_cycle()
+            self.btn_toggle_autosync.setText("▶️ Start Auto-Sync")
+            self.lbl_autosync_status.setText("⚫ Auto-Sync: Stopped")
+            self.lbl_autosync_status.setStyleSheet("color: #888; padding: 5px;")
+        else:
+            self.server.sync_manager.start_sync_cycle()
+            self.btn_toggle_autosync.setText("⏹️ Stop Auto-Sync")
+            self.lbl_autosync_status.setText("🟢 Auto-Sync: Running")
+            self.lbl_autosync_status.setStyleSheet("color: #90ee90; padding: 5px;")
+
+    def show_sync_status(self):
+        """Show detailed sync status with change tracking"""
+        if not hasattr(self.server, 'sync_manager'):
+            QMessageBox.information(
+                self, "Auto-Sync Status",
+                "Auto-sync is not configured"
+            )
+            return
+        
+        status = self.server.sync_manager.get_sync_status()
+        
+        status_text = f"""
+    <h3>🔄 Auto-Sync Status</h3>
+    <p><b>Status:</b> {'🟢 Running' if status['running'] else '⚫ Stopped'}</p>
+    <p><b>Check Interval:</b> {status['interval']} seconds</p>
+    <p><b>Clients Syncing:</b> {status['clients_syncing']}</p>
+    <p><b>Total Files Tracked:</b> {status['total_files']}</p>
+    <p><b>Backup Location:</b> {status['sync_dir']}</p>
+    <p><b>Version History:</b> {status['version_dir']}</p>
+    <p><b>Versions Kept:</b> {status['keep_versions']} per file</p>
+    <hr>
+    <h4>📊 Client Statistics:</h4>
+    """
+        
+        for client_key, stats in status.get('client_stats', {}).items():
+            hostname = client_key.split(":")[0]
+            with self.server.clients_lock:
+                if client_key in self.server.clients:
+                    handler = self.server.clients[client_key]
+                    hostname = handler.client_info.get("hostname", hostname)
+            
+            status_text += f"""
+    <p><b>💻 {hostname}:</b><br>
+    &nbsp;&nbsp;📝 Content changes detected: {stats.get('content_changes', 0)}<br>
+    &nbsp;&nbsp;🆕 New files: {stats.get('new_files', 0)}<br>
+    &nbsp;&nbsp;🗑️ Deleted files: {stats.get('deleted_files', 0)}<br>
+    &nbsp;&nbsp;💾 Total files synced: {stats.get('files_synced', 0)}<br>
+    &nbsp;&nbsp;📦 Data synced: {format_bytes(stats.get('bytes_synced', 0))}<br>
+    &nbsp;&nbsp;🕒 Last sync: {stats.get('last_sync', 'Never')}</p>
+    """
+        
+        msg_box = QMessageBox(self)
+        msg_box.setWindowTitle("Auto-Sync Status")
+        msg_box.setTextFormat(Qt.RichText)
+        msg_box.setText(status_text)
+        msg_box.setStandardButtons(QMessageBox.Ok)
+        msg_box.setIcon(QMessageBox.Information)
+        
+        # Add button to view version history
+        btn_view_versions = msg_box.addButton("📚 View File Versions", QMessageBox.ActionRole)
+        
+        result = msg_box.exec_()
+        
+        if msg_box.clickedButton() == btn_view_versions:
+            self.show_file_versions()
+    def show_file_versions(self):
+        """Show file version history browser"""
+        if not hasattr(self.server, 'sync_manager'):
+            return
+        
+        # Create dialog
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QLabel, QPushButton, QTextEdit
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle("📚 File Version History")
+        dialog.resize(800, 600)
+        dialog.setStyleSheet(self.styleSheet())
+        
+        layout = QVBoxLayout(dialog)
+        
+        title = QLabel("Select a client to view file versions:")
+        title.setFont(QFont("Segoe UI", 12, QFont.Bold))
+        layout.addWidget(title)
+        
+        # Client selection
+        client_list = QListWidget()
+        client_list.setMaximumHeight(150)
+        
+        for client_key in self.server.list_clients():
+            hostname = client_key.split(":")[0]
+            with self.server.clients_lock:
+                if client_key in self.server.clients:
+                    handler = self.server.clients[client_key]
+                    hostname = handler.client_info.get("hostname", hostname)
+            
+            item = client_list.addItem(f"💻 {hostname} ({client_key})")
+            item = client_list.item(client_list.count() - 1)
+            item.setData(Qt.UserRole, client_key)
+        
+        layout.addWidget(client_list)
+        
+        # Version info display
+        info_label = QLabel("Select a client to see tracked files")
+        layout.addWidget(info_label)
+        
+        version_text = QTextEdit()
+        version_text.setReadOnly(True)
+        version_text.setFont(QFont("Consolas", 9))
+        layout.addWidget(version_text)
+        
+        def show_client_versions():
+            selected = client_list.currentItem()
+            if not selected:
+                return
+            
+            client_key = selected.data(Qt.UserRole)
+            
+            # Get all tracked files for this client
+            metadata = self.server.sync_manager.file_metadata.get(client_key, {})
+            
+            if not metadata:
+                version_text.setText("No files tracked for this client yet.")
+                return
+            
+            output = f"📁 Files tracked for this client: {len(metadata)}\n\n"
+            
+            for file_path, meta in metadata.items():
+                file_name = meta.get("name", os.path.basename(file_path))
+                version = meta.get("version", 1)
+                size = meta.get("size", 0)
+                last_update = meta.get("last_update_str", "Unknown")
+                file_hash = meta.get("hash", "")[:16]
+                
+                output += f"📄 {file_name}\n"
+                output += f"   Current Version: v{version}\n"
+                output += f"   Size: {format_bytes(size)}\n"
+                output += f"   Hash: {file_hash}...\n"
+                output += f"   Last Updated: {last_update}\n"
+                
+                # Get version history
+                versions = self.server.sync_manager.get_file_history(client_key, file_name)
+                
+                if versions:
+                    output += f"   📚 Version History: {len(versions)} backup(s)\n"
+                    for v in versions[:5]:  # Show last 5 versions
+                        output += f"      • {v['filename']} - {format_bytes(v['size'])} - {v['modified']}\n"
+                
+                output += "\n"
+            
+            version_text.setText(output)
+            info_label.setText(f"✅ Showing {len(metadata)} tracked file(s)")
+        
+        client_list.currentItemChanged.connect(lambda: show_client_versions())
+        
+        # Buttons
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(dialog.close)
+        btn_layout.addWidget(btn_close)
+        
+        layout.addLayout(btn_layout)
+        
+        dialog.exec_()
+
+    def _update_autosync_ui(self):
+        """Update auto-sync UI status"""
+        if hasattr(self.server, 'sync_manager'):
+            if self.server.sync_manager.sync_running:
+                self.lbl_autosync_status.setText("🟢 Auto-Sync: Running")
+                self.lbl_autosync_status.setStyleSheet("color: #90ee90; padding: 5px;")
+                self.btn_toggle_autosync.setText("⏹️ Stop Auto-Sync")
+            else:
+                self.lbl_autosync_status.setText("⚫ Auto-Sync: Stopped")
+                self.lbl_autosync_status.setStyleSheet("color: #888; padding: 5px;")
+                self.btn_toggle_autosync.setText("▶️ Start Auto-Sync")
+                
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -2399,6 +3185,29 @@ class AdminWindow(QMainWindow):
         
         layout.addWidget(file_group)
         
+        # Auto-Sync Controls
+        autosync_group = QGroupBox("🔄 Auto-Sync Backup")
+        autosync_layout = QVBoxLayout(autosync_group)
+
+        self.lbl_autosync_status = QLabel("⚫ Auto-Sync: Disabled")
+        self.lbl_autosync_status.setStyleSheet("color: #888; padding: 5px;")
+        self.lbl_autosync_status.setAlignment(Qt.AlignCenter)
+        autosync_layout.addWidget(self.lbl_autosync_status)
+
+        btn_configure_autosync = QPushButton("⚙️ Configure Auto-Sync")
+        btn_configure_autosync.clicked.connect(self.configure_auto_sync)
+        autosync_layout.addWidget(btn_configure_autosync)
+
+        self.btn_toggle_autosync = QPushButton("▶️ Start Auto-Sync")
+        self.btn_toggle_autosync.clicked.connect(self.toggle_auto_sync)
+        autosync_layout.addWidget(self.btn_toggle_autosync)
+
+        btn_autosync_status = QPushButton("📊 View Sync Status")
+        btn_autosync_status.clicked.connect(self.show_sync_status)
+        autosync_layout.addWidget(btn_autosync_status)
+
+        layout.addWidget(autosync_group)
+
         # Monitoring
         monitor_group = QGroupBox("Monitoring")
         monitor_layout = QVBoxLayout(monitor_group)
