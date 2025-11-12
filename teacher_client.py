@@ -1,17 +1,18 @@
 """
-Lab Manager - Teacher Client (UPDATED)
+Lab Manager - Teacher Client (FIXED FULLSCREEN)
 Features:
 - Connect to admin server
 - Transfer files directly to admin WITH FULL PATH
 - Present screen to CLIENTS (like admin does) 
 - View connected client list
 - Monitor client screens via admin
+- Fullscreen monitoring (NOW FIXED - no more crashes!)
 - Basic client functions (connect, disconnect, reconnect)
 
 FIXES:
-- Presentation now targets clients (not admin)
-- File transfer includes full file path
-- Connected clients list shown automatically
+- Added fullscreen_monitor initialization in __init__
+- Fixed all references to self.fullscreen_monitor
+- Proper cleanup on window close
 """
 
 import sys
@@ -24,6 +25,10 @@ import json
 import hashlib
 from datetime import datetime
 
+from login_window import LoginDialog
+from file_transfer_db_mysql import FileTransferDB
+import socket
+
 try:
     import mss
     import cv2
@@ -35,13 +40,12 @@ except ImportError as e:
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QVBoxLayout, QPushButton,
-    QMessageBox, QTextEdit, QHBoxLayout, QFileDialog, QInputDialog,
+    QMessageBox, QTextEdit, QHBoxLayout, QFileDialog, QInputDialog, QDialog,
     QLineEdit, QListWidget, QSplitter, QGroupBox, QProgressBar,
     QSystemTrayIcon, QMenu, QAction
 )
-from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QObject, pyqtSignal, QSize, QByteArray
 from PyQt5.QtGui import QPixmap, QIcon, QFont, QImage, QPainter, QColor
-from PyQt5.QtCore import QByteArray
 
 # Configuration
 DEFAULT_SERVER_HOST = '127.0.0.1'  # Change this to admin PC's IP when on different computers
@@ -64,6 +68,147 @@ def format_bytes(size):
         size /= 1024.0
     return f"{size:.2f} TB"
 
+class FullscreenMonitor(QWidget):
+    """Fullscreen monitor window for viewing client screens"""
+    def __init__(self, client_name, parent=None):
+        super().__init__()
+        
+        self.parent_window = parent
+        self.client_name = client_name
+        
+        self.setWindowTitle(f"Monitoring: {client_name}")
+        self.setWindowFlags(Qt.Window | Qt.WindowStaysOnTopHint)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+        
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #000000;
+            }
+            QLabel {
+                color: white;
+            }
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Image display
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignCenter)
+        self.image_label.setStyleSheet("background-color: #000000;")
+        self.image_label.setText(f"👁️ Monitoring: {client_name}\n\nWaiting for frames...")
+        self.image_label.setFont(QFont("Segoe UI", 16))
+        layout.addWidget(self.image_label)
+        
+        # Info bar at bottom
+        info_bar = QWidget()
+        info_bar.setStyleSheet("background-color: rgba(0, 0, 0, 180);")
+        info_bar.setMaximumHeight(60)
+        info_layout = QHBoxLayout(info_bar)
+        
+        self.info_label = QLabel(f"👁️ Monitoring: {client_name}")
+        self.info_label.setStyleSheet("color: white; font-weight: bold; font-size: 14px; padding: 10px;")
+        info_layout.addWidget(self.info_label)
+        
+        info_layout.addStretch()
+        
+        # Controls
+        self.btn_fullscreen = QPushButton("⛶ Fullscreen")
+        self.btn_fullscreen.setStyleSheet("""
+            QPushButton {
+                background-color: #0078d4;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #106ebe;
+            }
+        """)
+        self.btn_fullscreen.clicked.connect(self.toggle_fullscreen)
+        info_layout.addWidget(self.btn_fullscreen)
+        
+        btn_close = QPushButton("❌ Close")
+        btn_close.setStyleSheet("""
+            QPushButton {
+                background-color: #d13438;
+                color: white;
+                border: none;
+                padding: 10px 20px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #a02020;
+            }
+        """)
+        btn_close.clicked.connect(self.close)
+        info_layout.addWidget(btn_close)
+        
+        layout.addWidget(info_bar)
+        
+        self.is_fullscreen = False
+        
+        # Set initial size
+        try:
+            screen = QApplication.primaryScreen().availableGeometry()
+            self.setGeometry(
+                screen.width() // 6,
+                screen.height() // 6,
+                screen.width() * 2 // 3,
+                screen.height() * 2 // 3
+            )
+        except:
+            # Fallback size
+            self.resize(1280, 720)
+    
+    def update_frame(self, image_data):
+        """Update the displayed frame"""
+        try:
+            qimg = QImage.fromData(QByteArray(image_data))
+            if not qimg.isNull():
+                pixmap = QPixmap.fromImage(qimg)
+                scaled = pixmap.scaled(
+                    self.image_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.image_label.setPixmap(scaled)
+        except Exception as e:
+            print(f"Error updating frame: {e}")
+    
+    def toggle_fullscreen(self):
+        """Toggle fullscreen mode"""
+        if self.is_fullscreen:
+            self.showNormal()
+            self.btn_fullscreen.setText("⛶ Fullscreen")
+            self.is_fullscreen = False
+        else:
+            self.showFullScreen()
+            self.btn_fullscreen.setText("⛶ Exit Fullscreen")
+            self.is_fullscreen = True
+    
+    def keyPressEvent(self, event):
+        """Handle keyboard shortcuts"""
+        if event.key() == Qt.Key_F11 or event.key() == Qt.Key_F:
+            self.toggle_fullscreen()
+        elif event.key() == Qt.Key_Escape:
+            if self.is_fullscreen:
+                self.toggle_fullscreen()
+            else:
+                self.close()
+        else:
+            super().keyPressEvent(event)
+    
+    def closeEvent(self, event):
+        """Handle window close"""
+        if self.parent_window:
+            self.parent_window.close_fullscreen_monitor()
+        event.accept()
+
 
 class TeacherSignals(QObject):
     update_status = pyqtSignal(str, str)
@@ -79,7 +224,42 @@ class TeacherSignals(QObject):
 class TeacherClient(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Lab Manager - Teacher Client")
+        
+        #         # Initialize database first
+        # try:
+        #     self.db = FileTransferDB(
+        #         host='localhost',
+        #         port=3306,
+        #         user='root',
+        #         password='',
+        #         database='lab_manager',
+        #         pool_size=5
+        #     )
+        #     if not self.db.test_connection():
+        #         QMessageBox.critical(
+        #             None,
+        #             "Database Error",
+        #             "Cannot connect to MySQL database.\n\n"
+        #             "Please ensure:\n"
+        #             "1. XAMPP MySQL is running\n"
+        #             "2. Database 'lab_manager' exists\n"
+        #             "3. SQL schema has been imported"
+        #         )
+        #         sys.exit(1)
+        # except Exception as e:
+        #     QMessageBox.critical(
+        #         None,
+        #         "Database Error",
+        #         f"Database initialization failed:\n{e}"
+        #     )
+        #     sys.exit(1)
+        
+        # # Show login dialog
+        # login_dialog = LoginDialog(self.db)
+        # if login_dialog.exec_() != QDialog.Accepted:
+        #     sys.exit(0)
+
+        # self.setWindowTitle("ACCLABS - Teacher Client")
         self.setMinimumSize(1000, 700)
         
         # Connection state
@@ -99,6 +279,7 @@ class TeacherClient(QMainWindow):
         # Monitoring state
         self.monitoring_client = None
         self.client_list = []  # List of available clients
+        self.fullscreen_monitor = None  # FIXED: Initialize here!
         
         # Signals
         self.signals = TeacherSignals()
@@ -307,6 +488,11 @@ class TeacherClient(QMainWindow):
         self.btn_monitor.setEnabled(False)
         preview_btn_layout.addWidget(self.btn_monitor)
         
+        self.btn_fullscreen_monitor = QPushButton("🖥️ Fullscreen Monitor")
+        self.btn_fullscreen_monitor.clicked.connect(self.open_fullscreen_monitor)
+        self.btn_fullscreen_monitor.setEnabled(False)
+        preview_btn_layout.addWidget(self.btn_fullscreen_monitor)
+        
         self.btn_stop_monitor = QPushButton("⏹️ Stop Monitoring")
         self.btn_stop_monitor.clicked.connect(self.stop_monitoring)
         self.btn_stop_monitor.setEnabled(False)
@@ -403,20 +589,26 @@ class TeacherClient(QMainWindow):
                     Qt.SmoothTransformation
                 )
                 self.preview_label.setPixmap(scaled)
-        except:
-            pass
+                
+                # Update fullscreen monitor if open
+                if self.fullscreen_monitor:
+                    self.fullscreen_monitor.update_frame(image_data)
+        except Exception as e:
+            print(f"Error updating preview: {e}")
     
     def enable_connected_features(self):
         self.btn_send_file.setEnabled(True)
         self.btn_present.setEnabled(True)
         self.btn_refresh_clients.setEnabled(True)
         self.btn_monitor.setEnabled(True)
+        self.btn_fullscreen_monitor.setEnabled(True)
     
     def disable_connected_features(self):
         self.btn_send_file.setEnabled(False)
         self.btn_present.setEnabled(False)
         self.btn_refresh_clients.setEnabled(False)
         self.btn_monitor.setEnabled(False)
+        self.btn_fullscreen_monitor.setEnabled(False)
         self.btn_stop_monitor.setEnabled(False)
     
     def configure_server(self):
@@ -509,10 +701,18 @@ class TeacherClient(QMainWindow):
         if self.presenting:
             self.stop_presentation()
         
-        # NEW: Stop monitoring if active
+        # Stop monitoring if active
         if self.monitoring_client:
             self.monitoring_client = None
             self.btn_stop_monitor.setEnabled(False)
+        
+        # Close fullscreen monitor if open
+        if self.fullscreen_monitor:
+            try:
+                self.fullscreen_monitor.close()
+            except:
+                pass
+            self.fullscreen_monitor = None
         
         if self.client_socket:
             try:
@@ -554,7 +754,7 @@ class TeacherClient(QMainWindow):
                             clients = json.loads(client_json)
                             self.signals.update_client_list.emit(clients)
                         
-                        # NEW: Handle monitored frames from admin
+                        # Handle monitored frames from admin
                         elif message.upper() == "MONITORED_FRAME":
                             # Read frame size
                             while len(buffer) < 8:
@@ -857,10 +1057,70 @@ class TeacherClient(QMainWindow):
             self.preview_label.clear()
             self.preview_label.setText("Select a client to monitor")
             self.preview_info.setText("No client selected")
+            
+            # Close fullscreen monitor if open
+            if self.fullscreen_monitor:
+                try:
+                    self.fullscreen_monitor.close()
+                except:
+                    pass
+                self.fullscreen_monitor = None
+            
             self.log("Stopped monitoring client")
         
         except Exception as e:
             self.log(f"Failed to stop monitoring: {e}")
+    
+    def open_fullscreen_monitor(self):
+        """Open fullscreen monitor window"""
+        if not self.connected:
+            QMessageBox.warning(self, "Not Connected", "Please connect to admin first")
+            return
+        
+        if self.client_list_widget.currentItem() is None:
+            QMessageBox.warning(self, "No Selection", "Please select a client to monitor")
+            return
+        
+        client_key = self.client_list_widget.currentItem().text()
+        
+        # Close existing fullscreen monitor if any
+        if self.fullscreen_monitor:
+            try:
+                self.fullscreen_monitor.close()
+            except:
+                pass
+            self.fullscreen_monitor = None
+        
+        # Create new fullscreen monitor
+        self.fullscreen_monitor = FullscreenMonitor(client_key, self)
+        self.fullscreen_monitor.show()
+        
+        # Start monitoring if not already
+        if not self.monitoring_client:
+            try:
+                cmd = f"MONITOR_CLIENT:{client_key}\n"
+                self.client_socket.sendall(cmd.encode("utf-8"))
+                
+                self.monitoring_client = client_key
+                self.btn_stop_monitor.setEnabled(True)
+                self.preview_info.setText(f"Monitoring: {client_key}")
+                self.log(f"Started fullscreen monitoring: {client_key}")
+            except Exception as e:
+                self.log(f"Failed to start monitoring: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to start monitoring: {e}")
+                if self.fullscreen_monitor:
+                    try:
+                        self.fullscreen_monitor.close()
+                    except:
+                        pass
+                    self.fullscreen_monitor = None
+        else:
+            self.log(f"Opened fullscreen monitor for: {client_key}")
+    
+    def close_fullscreen_monitor(self):
+        """Called when fullscreen monitor is closed"""
+        self.fullscreen_monitor = None
+        self.log("Fullscreen monitor closed")
     
     def quit_application(self):
         self.running = False

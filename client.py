@@ -1158,7 +1158,13 @@ class StudentClient(QWidget):
         elif command == "RESTART_PC":
             self.restart_pc()
             return
-        
+        elif command == "BLOCK_INCOGNITO":
+                threading.Thread(target=self.block_incognito_mode, daemon=True).start()
+                return
+
+        elif command == "UNBLOCK_INCOGNITO":
+                threading.Thread(target=self.unblock_incognito_mode, daemon=True).start()
+                return
         if command.startswith("RESTRICTIONS:"):
             try:
                 restrictions_json = command.split(":", 1)[1]
